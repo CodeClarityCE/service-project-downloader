@@ -1,0 +1,28 @@
+services:
+  service-downloader:
+    build:
+      context: ../../backend
+      dockerfile: services/downloader/.cloud/docker/Dockerfile
+      target: plugin-dev
+      args:
+        - PLUGINNAME=downloader
+        - KIND=services
+    image: ceherzog/service-downloader-dev:latest
+    restart: always
+    volumes:
+      - ../../backend:/codeclarity
+      - projects:/private
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      db:
+        condition: service_started
+      pg_bouncer:
+        condition: service_started
+      adminer:
+        condition: service_started
+    env_file:
+      - ../../.cloud/env/.env.dev
+
+volumes:
+  projects:
