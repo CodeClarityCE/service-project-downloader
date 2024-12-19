@@ -7,7 +7,7 @@ services:
       args:
         - PLUGINNAME=downloader
         - KIND=services
-    image: ceherzog/service-downloader-dev:latest
+    image: codeclarityce/service-downloader-dev:latest
     restart: always
     volumes:
       - ../../backend:/codeclarity

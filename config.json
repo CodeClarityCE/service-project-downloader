@@ -1,7 +1,7 @@
 {
     "name": "downloader",
     "version": "v0.0.1-alpha",
-    "image_name": "ceherzog/service-downloader",
+    "image_name": "codeclarityce/service-downloader",
     "image_version": "0.0.1",
     "depends_on": []
 }

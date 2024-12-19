@@ -3,6 +3,6 @@ services:
     # For dev we keep the golang container and install devtools
     build:
       target: plugin-debug
-    image: ceherzog/service-downloader-debug:latest
+    image: codeclarityce/service-downloader-debug:latest
     ports:
       - 40000:40000
