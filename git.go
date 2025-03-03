@@ -33,7 +33,7 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 	path := os.Getenv("DOWNLOAD_PATH")
 
 	// Destination folder
-	destination := fmt.Sprintf("%s/%s/%s", path, organization, project.Id)
+	destination := fmt.Sprintf("%s/%s/%s/%s", path, organization, "projects", project.Id)
 
 	if analysis.Commit == "" || analysis.Commit == " " {
 		destination = fmt.Sprintf("%s/%s", destination, analysis.Branch)
