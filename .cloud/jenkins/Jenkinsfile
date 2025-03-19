@@ -21,7 +21,7 @@ pipeline {
                 sh 'git fetch --tags --force'
                 script {
                     def project =readJSON file: 'config.json'
-                    env.Version = project.image_version
+                    env.Version = project.version
                     env.Name = project.image_name
                     sh 'echo $Version'
                     env.Tag = "${Name}:${Version}"
