@@ -24,7 +24,7 @@ pipeline {
                     env.Version = project.version
                     env.Name = project.image_name
                     sh 'echo $Version'
-                    env.Tag = "${Name}:${Version}"
+                    env.Tag = "${Name}:${Version.substring(1)}"
                     sh 'echo $Tag'
                     sh "sh .cloud/jenkins/check_version.sh ${Version}"
                     withCredentials(
