@@ -128,7 +128,7 @@ func dispatch(connection string, d amqp.Delivery) {
 			// TODO: Send error message
 		}
 
-		project_info, err := getProject(analysis_info.ProjectId)
+		project_info, err := getProject(*analysis_info.ProjectId)
 		if err != nil {
 			log.Printf("%v", err)
 		}
