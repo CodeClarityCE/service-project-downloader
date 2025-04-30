@@ -47,7 +47,7 @@ ARG USERNAME
 ARG PLUGINNAME
 RUN apk update && apk upgrade --no-cache
 RUN apk add --no-cache git
-RUN adduser -D ${USERNAME}
+RUN addgroup -S ${USERNAME} --gid 1001 && adduser -S ${USERNAME} -G ${USERNAME} --uid 1001 -D
 RUN mkdir /private
 RUN chown -R ${USERNAME}:${USERNAME} /private
 USER ${USERNAME}
