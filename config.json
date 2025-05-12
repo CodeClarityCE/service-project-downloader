@@ -1,6 +1,6 @@
 {
     "name": "downloader",
-    "version": "v0.0.6-alpha",
+    "version": "v0.0.7-alpha",
     "image_name": "codeclarityce/service-downloader",
     "depends_on": []
 }
