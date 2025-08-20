@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -145,9 +146,28 @@ func dispatch(connection string, d amqp.Delivery) {
 			// TODO Send error message
 		}
 
-		// Send message to dispatcher
-		// Change type
-		downloaderMessage := types_amqp.DownloaderDispatcherMessage(apiMessage)
+		// Detect languages from the downloaded repository
+		// Build the project path where the repository was cloned
+		path := os.Getenv("DOWNLOAD_PATH")
+		destination := fmt.Sprintf("%s/%s/%s/%s", path, apiMessage.OrganizationId, "projects", project_info.Id)
+		if analysis_info.Commit == "" || analysis_info.Commit == " " {
+			destination = fmt.Sprintf("%s/%s", destination, analysis_info.Branch)
+		} else {
+			destination = fmt.Sprintf("%s/%s", destination, analysis_info.Commit)
+		}
+
+		languageResult := detectLanguagesFromRepository(destination)
+
+		// Send message to dispatcher with language detection results
+		downloaderMessage := types_amqp.DownloaderDispatcherMessage{
+			AnalysisId:          apiMessage.AnalysisId,
+			ProjectId:           apiMessage.ProjectId,
+			IntegrationId:       apiMessage.IntegrationId,
+			OrganizationId:      apiMessage.OrganizationId,
+			DetectedLanguages:   languageResult.DetectedLanguages,
+			PrimaryLanguage:     languageResult.PrimaryLanguage,
+			DetectionConfidence: languageResult.DetectionConfidence,
+		}
 		// downloaderMessage := types_amqp.DownloaderDispatcherMessage{
 		// 	AnalysisId:     apiMessage.AnalysisId,
 		// 	ProjectId:      apiMessage.ProjectId,
