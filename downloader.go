@@ -4,18 +4,18 @@ package main
 import (
 	"log"
 
-	"github.com/CodeClarityCE/utility-types/ecosystem"
+	"github.com/CodeClarityCE/utility-types/boilerplates"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 // DownloaderService wraps the ServiceBase with downloader-specific functionality
 type DownloaderService struct {
-	*ecosystem.ServiceBase
+	*boilerplates.ServiceBase
 }
 
-// NewDownloaderService creates a new DownloaderService
-func NewDownloaderService() (*DownloaderService, error) {
-	base, err := ecosystem.NewServiceBase()
+// CreateDownloaderService creates a new DownloaderService
+func CreateDownloaderService() (*DownloaderService, error) {
+	base, err := boilerplates.CreateServiceBase()
 	if err != nil {
 		return nil, err
 	}
@@ -32,7 +32,7 @@ func NewDownloaderService() (*DownloaderService, error) {
 
 // handleDispatcherMessage handles messages from dispatcher
 func (s *DownloaderService) handleDispatcherMessage(d amqp.Delivery) {
-	dispatch("dispatcher_downloader", d)
+	dispatch("dispatcher_downloader", d, s.ServiceBase)
 }
 
 func main() {
@@ -41,7 +41,7 @@ func main() {
 
 // Downloader is a function that starts the downloader service using ServiceBase.
 func Downloader() {
-	service, err := NewDownloaderService()
+	service, err := CreateDownloaderService()
 	if err != nil {
 		log.Fatalf("Failed to create downloader service: %v", err)
 	}
