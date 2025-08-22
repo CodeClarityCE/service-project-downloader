@@ -2,6 +2,8 @@ module github.com/CodeClarityCE/service-project-downloader
 
 go 1.24.3
 
+replace github.com/CodeClarityCE/utility-types => ../../utilities/types
+
 require (
 	github.com/CodeClarityCE/utility-types v0.0.11-alpha
 	github.com/google/uuid v1.6.0
@@ -13,6 +15,8 @@ require (
 )
 
 require (
+	github.com/CodeClarityCE/utility-amqp-helper v0.0.6-alpha // indirect
+	github.com/CodeClarityCE/utility-dbhelper v0.0.8-alpha // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/puzpuzpuz/xsync/v3 v3.5.1 // indirect
 	github.com/tmthrgd/go-hex v0.0.0-20190904060850-447a3041c3bc // indirect
