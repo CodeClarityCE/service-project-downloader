@@ -35,7 +35,18 @@ func TestMain(t *testing.T) {
 	os.Setenv("AMQP_USER", "guest")
 	os.Setenv("AMQP_PASSWORD", "guest")
 	os.Setenv("DOWNLOAD_PATH", "/tmp")
-	receiveMessage("dispatcher_downloader")
+
+	// Test now uses ServiceBase instead of legacy receiveMessage
+	service, err := CreateDownloaderService()
+	if err != nil {
+		t.Fatalf("Failed to create downloader service: %v", err)
+	}
+	defer service.Close()
+
+	// Test that service was created successfully
+	if service == nil {
+		t.Error("Expected service to be created, got nil")
+	}
 }
 
 func TestScenario1(t *testing.T) {
@@ -47,7 +58,7 @@ func TestScenario1(t *testing.T) {
 		// `t.Error*` will report test failures but continue
 		// executing the test. `t.Fatal*` will report test
 		// failures and stop the test immediately.
-		t.Errorf(err.Error())
+		t.Errorf("%s", err.Error())
 	}
 
 	// Listen for messages
