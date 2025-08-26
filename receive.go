@@ -6,8 +6,8 @@ import (
 	"log"
 	"os"
 
+	"github.com/CodeClarityCE/utility-boilerplates"
 	types_amqp "github.com/CodeClarityCE/utility-types/amqp"
-	"github.com/CodeClarityCE/utility-types/boilerplates"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
