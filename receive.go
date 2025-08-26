@@ -6,11 +6,10 @@ import (
 	"log"
 	"os"
 
-	"github.com/CodeClarityCE/utility-types/boilerplates"
 	types_amqp "github.com/CodeClarityCE/utility-types/amqp"
+	"github.com/CodeClarityCE/utility-types/boilerplates"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
-
 
 // dispatch is a function that handles the received message from the "dispatcher_downloader" connection.
 // It reads the message from the API, retrieves analysis, project, and integration information,

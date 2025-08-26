@@ -35,14 +35,14 @@ func TestMain(t *testing.T) {
 	os.Setenv("AMQP_USER", "guest")
 	os.Setenv("AMQP_PASSWORD", "guest")
 	os.Setenv("DOWNLOAD_PATH", "/tmp")
-	
+
 	// Test now uses ServiceBase instead of legacy receiveMessage
 	service, err := CreateDownloaderService()
 	if err != nil {
 		t.Fatalf("Failed to create downloader service: %v", err)
 	}
 	defer service.Close()
-	
+
 	// Test that service was created successfully
 	if service == nil {
 		t.Error("Expected service to be created, got nil")
