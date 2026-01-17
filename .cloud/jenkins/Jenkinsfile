@@ -26,9 +26,6 @@ pipeline {
                 }
                 sh 'git submodule update --init --recursive'
                 sh 'git fetch --tags --force origin'
-                withCredentials([file(credentialsId: 'netrc', variable: 'netrc')]) {
-                    writeFile file: '.cloud/docker/config/.netrc', text: readFile(netrc)
-                }
             }
         }
 
@@ -82,12 +79,11 @@ pipeline {
     }
 
     post {
-        always {
-            sh 'rm -f .cloud/docker/config/.netrc || true'
-        }
         failure {
-            echo "Build failed for ${ImageName}:${Tag}"
-            sh 'docker buildx rm builder || true'
+            echo "Build failed for ${env.ImageName ?: 'unknown'}:${env.Tag ?: 'unknown'}"
+            node('codeclarity') {
+                sh 'docker buildx rm builder || true'
+            }
         }
     }
 }
