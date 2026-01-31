@@ -20,7 +20,7 @@ import (
 // - service: ServiceBase instance for sending messages
 // Returns: None
 func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceBase) {
-	if connection == "dispatcher_downloader" { // If message is from symfony_request
+	if connection == "dispatcher_downloader" { // If message is from dispatcher
 		// Read message from API
 		var apiMessage types_amqp.DispatcherDownloaderMessage
 		json.Unmarshal([]byte(d.Body), &apiMessage)
@@ -30,23 +30,40 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 		if err != nil {
 			log.Printf("%v", err)
 			// TODO: Send error message
+			return
 		}
 
 		project_info, err := getProject(service.DB.CodeClarity, *analysis_info.ProjectId)
 		if err != nil {
 			log.Printf("%v", err)
+			return
 		}
 
-		integration_info, err := getIntegration(service.DB.CodeClarity, apiMessage.IntegrationId)
-		if err != nil {
-			log.Printf("%v", err)
-		}
+		// Handle based on project type
+		if project_info.Type == "FILE" {
+			// FILE project - extract uploaded archive
+			log.Printf("Processing FILE project: %s", project_info.Id)
+			err = Archive(analysis_info, project_info, apiMessage.OrganizationId)
+			if err != nil {
+				log.Printf("Failed to extract archive: %v", err)
+				// TODO Send error message
+				return
+			}
+		} else {
+			// VCS project (GITHUB, GITLAB) - git clone
+			log.Printf("Processing VCS project: %s (type: %s)", project_info.Id, project_info.Type)
+			integration_info, err := getIntegration(service.DB.CodeClarity, apiMessage.IntegrationId)
+			if err != nil {
+				log.Printf("%v", err)
+				return
+			}
 
-		// Download project
-		err = Git(analysis_info, project_info, integration_info, apiMessage.OrganizationId)
-		if err != nil {
-			log.Printf("%v", err)
-			// TODO Send error message
+			err = Git(analysis_info, project_info, integration_info, apiMessage.OrganizationId)
+			if err != nil {
+				log.Printf("Failed to clone repository: %v", err)
+				// TODO Send error message
+				return
+			}
 		}
 
 		// Detect languages from the downloaded repository
