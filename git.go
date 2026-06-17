@@ -42,43 +42,80 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 		destination = fmt.Sprintf("%s/%s", destination, analysis.Commit)
 	}
 
-	// Clone project
-	cmd := exec.Command("git", "clone", "--recursive", "-b", analysis.Branch, url, destination)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		log.Println(err.Error())
-		// updateDownloadStatus(name, project, "f")
-		cmd := exec.Command("git", "pull")
-		cmd.Dir = destination
+	// HEAD analyses: a shallow single-branch clone is far faster and smaller on
+	// large repos.
+	if analysis.Commit == "" || analysis.Commit == " " {
+		cmd := exec.Command("git", "clone", "--depth", "1", "--single-branch",
+			"--recurse-submodules", "--shallow-submodules", "-b", analysis.Branch, url, destination)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		err := cmd.Run()
-		if err != nil {
+		if err := cmd.Run(); err != nil {
 			log.Println(err.Error())
-			return err
+			// The destination may already exist from a previous run — try to
+			// refresh it in place rather than failing outright.
+			pull := exec.Command("git", "pull")
+			pull.Dir = destination
+			pull.Stdout = os.Stdout
+			pull.Stderr = os.Stderr
+			if err2 := pull.Run(); err2 != nil {
+				log.Println(err2.Error())
+				return err
+			}
 		}
-	}
-
-	if analysis.Commit == "" || analysis.Commit == " " {
 		return nil
 	}
 
-	// Check branches
+	// Historical-commit analyses: shallow-fetch the exact commit by SHA (GitHub
+	// serves reachable SHAs), avoiding a full-history clone. Fall back to a full
+	// clone + checkout if the server won't serve the SHA directly.
+	if err := shallowFetchCommit(url, analysis.Commit, destination); err == nil {
+		return nil
+	} else {
+		log.Printf("shallow fetch of %s failed (%s); falling back to full clone", analysis.Commit, err)
+	}
+
+	_ = os.RemoveAll(destination)
+	cmd := exec.Command("git", "clone", "--recursive", "-b", analysis.Branch, url, destination)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		log.Println(err.Error())
+		return err
+	}
 	cmd = exec.Command("git", "checkout", analysis.Commit)
 	cmd.Dir = destination
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err = cmd.Run()
-	if err != nil {
+	if err := cmd.Run(); err != nil {
 		log.Println(err.Error())
-		// updateDownloadStatus(name, project, "f")
 		return err
 	}
+	return nil
+}
 
-	// Update download status
-	// updateDownloadStatus(name, project, "t")
+// shallowFetchCommit initialises a repo at destination and shallow-fetches
+// exactly the requested commit (depth 1), then checks it out. This is far
+// cheaper than a full clone for historical snapshots. Returns an error if any
+// git step fails so the caller can fall back to a full clone.
+func shallowFetchCommit(url, commit, destination string) error {
+	if err := os.MkdirAll(destination, 0o755); err != nil {
+		return err
+	}
+	steps := [][]string{
+		{"init", "-q"},
+		{"remote", "add", "origin", url},
+		{"fetch", "--depth", "1", "--recurse-submodules", "origin", commit},
+		{"checkout", "--recurse-submodules", "FETCH_HEAD"},
+	}
+	for _, args := range steps {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = destination
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("git %s: %w", args[0], err)
+		}
+	}
 	return nil
 }
 
