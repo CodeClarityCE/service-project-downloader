@@ -1,17 +1,64 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 )
+
+// ErrCommitUnresolvable is returned when a historical-commit analysis cannot be
+// resolved by any strategy (shallow fetch-by-SHA miss and full-clone+checkout
+// also miss). It is wrapped into the returned error so the caller can classify
+// the terminal failure and logs are greppable.
+var ErrCommitUnresolvable = errors.New("CommitUnresolvable")
+
+// defaultDownloadTimeout bounds a single Git() resolve/clone so a hung fetch
+// (unreachable host, blocking network, credential stall) becomes a terminal
+// failure instead of wedging the downloader's serial consumer forever.
+const defaultDownloadTimeout = 600 * time.Second
+
+// downloadTimeout returns the per-download deadline, overridable via
+// DOWNLOAD_TIMEOUT_SECONDS (seconds). Mirrors the env-override convention used
+// elsewhere (REAPER_INTERVAL, DB_MAX_OPEN_CONNS).
+func downloadTimeout() time.Duration {
+	if v := os.Getenv("DOWNLOAD_TIMEOUT_SECONDS"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+		log.Printf("[downloader] invalid DOWNLOAD_TIMEOUT_SECONDS=%q, using default %s", v, defaultDownloadTimeout)
+	}
+	return defaultDownloadTimeout
+}
+
+// runGit runs a git command bounded by ctx, with interactive prompts disabled so
+// a missing/invalid credential fails fast instead of blocking on a terminal
+// prompt. On ctx timeout the process is killed so a hung fetch is reclaimed.
+func runGit(ctx context.Context, dir string, args ...string) error {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0", // no interactive username/password prompt
+		"GIT_ASKPASS=true",      // no askpass helper hang
+		"GCM_INTERACTIVE=never", // git-credential-manager non-interactive
+	)
+	cmd.Cancel = func() error { return cmd.Process.Kill() }
+	return cmd.Run()
+}
 
 // Git clones a git project and checks out a specific branch or commit.
 // It takes an analysis, project, integration, and organization as input parameters.
@@ -22,6 +69,11 @@ import (
 // If the analysis has a commit specified, Git checks out that commit after cloning the project.
 // The function returns an error if any of the git commands fail.
 func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration codeclarity.Integration, organization uuid.UUID) error {
+	// Bound the whole resolve/clone so a hung fetch becomes a terminal failure
+	// rather than wedging the serial consumer.
+	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout())
+	defer cancel()
+
 	// Clone git project
 	url := ""
 	if strings.Contains(project.Url, "gitlab") {
@@ -45,19 +97,12 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 	// HEAD analyses: a shallow single-branch clone is far faster and smaller on
 	// large repos.
 	if analysis.Commit == "" || analysis.Commit == " " {
-		cmd := exec.Command("git", "clone", "--depth", "1", "--single-branch",
-			"--recurse-submodules", "--shallow-submodules", "-b", analysis.Branch, url, destination)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		if err := runGit(ctx, "", "clone", "--depth", "1", "--single-branch",
+			"--recurse-submodules", "--shallow-submodules", "-b", analysis.Branch, url, destination); err != nil {
 			log.Println(err.Error())
 			// The destination may already exist from a previous run — try to
 			// refresh it in place rather than failing outright.
-			pull := exec.Command("git", "pull")
-			pull.Dir = destination
-			pull.Stdout = os.Stdout
-			pull.Stderr = os.Stderr
-			if err2 := pull.Run(); err2 != nil {
+			if err2 := runGit(ctx, destination, "pull"); err2 != nil {
 				log.Println(err2.Error())
 				return err
 			}
@@ -68,27 +113,20 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 	// Historical-commit analyses: shallow-fetch the exact commit by SHA (GitHub
 	// serves reachable SHAs), avoiding a full-history clone. Fall back to a full
 	// clone + checkout if the server won't serve the SHA directly.
-	if err := shallowFetchCommit(url, analysis.Commit, destination); err == nil {
+	if err := shallowFetchCommit(ctx, url, analysis.Commit, destination); err == nil {
 		return nil
 	} else {
 		log.Printf("shallow fetch of %s failed (%s); falling back to full clone", analysis.Commit, err)
 	}
 
 	_ = os.RemoveAll(destination)
-	cmd := exec.Command("git", "clone", "--recursive", "-b", analysis.Branch, url, destination)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := runGit(ctx, "", "clone", "--recursive", "-b", analysis.Branch, url, destination); err != nil {
 		log.Println(err.Error())
-		return err
+		return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
 	}
-	cmd = exec.Command("git", "checkout", analysis.Commit)
-	cmd.Dir = destination
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := runGit(ctx, destination, "checkout", analysis.Commit); err != nil {
 		log.Println(err.Error())
-		return err
+		return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
 	}
 	return nil
 }
@@ -97,7 +135,7 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 // exactly the requested commit (depth 1), then checks it out. This is far
 // cheaper than a full clone for historical snapshots. Returns an error if any
 // git step fails so the caller can fall back to a full clone.
-func shallowFetchCommit(url, commit, destination string) error {
+func shallowFetchCommit(ctx context.Context, url, commit, destination string) error {
 	if err := os.MkdirAll(destination, 0o755); err != nil {
 		return err
 	}
@@ -108,11 +146,7 @@ func shallowFetchCommit(url, commit, destination string) error {
 		{"checkout", "--recurse-submodules", "FETCH_HEAD"},
 	}
 	for _, args := range steps {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = destination
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
+		if err := runGit(ctx, destination, args...); err != nil {
 			return fmt.Errorf("git %s: %w", args[0], err)
 		}
 	}

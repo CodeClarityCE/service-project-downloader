@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -64,7 +66,11 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 
 			err = Git(analysis_info, project_info, integration_info, apiMessage.OrganizationId)
 			if err != nil {
-				log.Printf("Failed to clone repository: %v", err)
+				if errors.Is(err, ErrCommitUnresolvable) || errors.Is(err, context.DeadlineExceeded) {
+					log.Printf("[downloader] analysis %s: commit unresolvable/timed out, failing: %v", apiMessage.AnalysisId, err)
+				} else {
+					log.Printf("[downloader] analysis %s: download failed: %v", apiMessage.AnalysisId, err)
+				}
 				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId)
 				return
 			}
