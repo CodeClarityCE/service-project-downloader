@@ -18,15 +18,22 @@ import (
 )
 
 // ErrCommitUnresolvable is returned when a historical-commit analysis cannot be
-// resolved by any strategy (shallow fetch-by-SHA miss and full-clone+checkout
-// also miss). It is wrapped into the returned error so the caller can classify
-// the terminal failure and logs are greppable.
+// resolved by any strategy (shallow fetch-by-SHA miss and blobless
+// clone+checkout also miss). It is wrapped into the returned error so the
+// caller can classify the terminal failure and logs are greppable.
 var ErrCommitUnresolvable = errors.New("CommitUnresolvable")
 
 // defaultDownloadTimeout bounds a single Git() resolve/clone so a hung fetch
 // (unreachable host, blocking network, credential stall) becomes a terminal
 // failure instead of wedging the downloader's serial consumer forever.
 const defaultDownloadTimeout = 600 * time.Second
+
+// shallowFetchTimeout bounds the tier-1 shallow fetch-by-SHA attempt on
+// historical-commit analyses. Derived as a child of the overall download
+// context, so the effective budget is min(shallowFetchTimeout, time remaining);
+// a hung shallow attempt cannot eat the whole budget the blobless-clone
+// fallback needs on large repos.
+const shallowFetchTimeout = 120 * time.Second
 
 // downloadTimeout returns the per-download deadline, overridable via
 // DOWNLOAD_TIMEOUT_SECONDS (seconds). Mirrors the env-override convention used
@@ -110,21 +117,35 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 		return nil
 	}
 
-	// Historical-commit analyses: shallow-fetch the exact commit by SHA (GitHub
-	// serves reachable SHAs), avoiding a full-history clone. Fall back to a full
-	// clone + checkout if the server won't serve the SHA directly.
-	if err := shallowFetchCommit(ctx, url, analysis.Commit, destination); err == nil {
+	// Historical-commit analyses resolve in two tiers:
+	//  1. Shallow-fetch the exact commit by SHA (GitHub serves reachable SHAs),
+	//     the cheap happy path — bounded by its own sub-deadline so a hung
+	//     attempt leaves budget for the fallback.
+	//  2. Blobless clone (--filter=blob:none): the full commit/tree DAG at
+	//     ~5-10x less transfer than a full clone (fits the deadline on large
+	//     repos); checkout faults in only the requested commit's blobs. No -b
+	//     flag — fetching all refs resolves any reachable commit even if its
+	//     branch moved or was deleted.
+	shallowCtx, cancelShallow := context.WithTimeout(ctx, shallowFetchTimeout)
+	shallowErr := shallowFetchCommit(shallowCtx, url, analysis.Commit, destination)
+	cancelShallow()
+	if shallowErr == nil {
 		return nil
-	} else {
-		log.Printf("shallow fetch of %s failed (%s); falling back to full clone", analysis.Commit, err)
 	}
+	log.Printf("shallow fetch of %s failed (%s); falling back to blobless clone", analysis.Commit, shallowErr)
 
 	_ = os.RemoveAll(destination)
-	if err := runGit(ctx, "", "clone", "--recursive", "-b", analysis.Branch, url, destination); err != nil {
+	if err := runGit(ctx, "", "clone", "--filter=blob:none", "--no-checkout", url, destination); err != nil {
 		log.Println(err.Error())
 		return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
 	}
-	if err := runGit(ctx, destination, "checkout", analysis.Commit); err != nil {
+	// Non-fatal: catches SHAs the server serves but that are not reachable from
+	// any advertised ref (e.g. force-pushed-away commits); the checkout below
+	// decides success either way.
+	if err := runGit(ctx, destination, "fetch", "origin", analysis.Commit); err != nil {
+		log.Printf("fetch of %s by SHA failed (%s); trying checkout from cloned refs", analysis.Commit, err)
+	}
+	if err := runGit(ctx, destination, "checkout", "--recurse-submodules", analysis.Commit); err != nil {
 		log.Println(err.Error())
 		return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
 	}
@@ -133,8 +154,8 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 
 // shallowFetchCommit initialises a repo at destination and shallow-fetches
 // exactly the requested commit (depth 1), then checks it out. This is far
-// cheaper than a full clone for historical snapshots. Returns an error if any
-// git step fails so the caller can fall back to a full clone.
+// cheaper than any clone for historical snapshots. Returns an error if any
+// git step fails so the caller can fall back to a blobless clone.
 func shallowFetchCommit(ctx context.Context, url, commit, destination string) error {
 	if err := os.MkdirAll(destination, 0o755); err != nil {
 		return err

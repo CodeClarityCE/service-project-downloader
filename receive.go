@@ -40,7 +40,7 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 		project_info, err := getProject(service.DB.CodeClarity, *analysis_info.ProjectId)
 		if err != nil {
 			log.Printf("Failed to load project for analysis %s: %v", apiMessage.AnalysisId, err)
-			markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId)
+			markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, err)
 			return
 		}
 
@@ -51,7 +51,7 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 			err = Archive(analysis_info, project_info, apiMessage.OrganizationId)
 			if err != nil {
 				log.Printf("Failed to extract archive: %v", err)
-				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId)
+				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, err)
 				return
 			}
 		} else {
@@ -60,7 +60,7 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 			integration_info, err := getIntegration(service.DB.CodeClarity, apiMessage.IntegrationId)
 			if err != nil {
 				log.Printf("Failed to load integration for analysis %s: %v", apiMessage.AnalysisId, err)
-				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId)
+				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, err)
 				return
 			}
 
@@ -71,7 +71,7 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 				} else {
 					log.Printf("[downloader] analysis %s: download failed: %v", apiMessage.AnalysisId, err)
 				}
-				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId)
+				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, err)
 				return
 			}
 		}

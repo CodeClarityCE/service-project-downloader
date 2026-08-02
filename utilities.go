@@ -57,16 +57,29 @@ func getIntegration(db *bun.DB, integrationID uuid.UUID) (codeclarity.Integratio
 	return *integration_document, nil
 }
 
-// markAnalysisFailed sets a non-terminal analysis to FAILURE. A download error is
+// failureReasonMaxLen matches the API's varchar(500) failure_reason column;
+// reasons are truncated so an arbitrarily long git error cannot overflow it.
+const failureReasonMaxLen = 500
+
+// markAnalysisFailed sets a non-terminal analysis to FAILURE and persists why
+// (failure_reason) in the same UPDATE, so callers polling the analysis can
+// distinguish e.g. unresolvable commits from crashes. A download error is
 // terminal — re-running it would fail again — so marking it stops the dispatcher's
 // reaper from re-driving it forever (the recovery loop is bounded by this write).
 // The status guard keeps it idempotent and avoids clobbering an already-terminal
 // row. Failures are logged, not propagated: the message is dropped either way.
-func markAnalysisFailed(db *bun.DB, analysisID uuid.UUID) {
+func markAnalysisFailed(db *bun.DB, analysisID uuid.UUID, reason error) {
+	msg := reason.Error()
+	// Truncate by runes, not bytes: varchar(500) counts characters, and a
+	// byte-level cut could split a multi-byte character into invalid UTF-8.
+	if r := []rune(msg); len(r) > failureReasonMaxLen {
+		msg = string(r[:failureReasonMaxLen])
+	}
 	ctx := context.Background()
 	_, err := db.NewUpdate().
 		Model((*codeclarity.Analysis)(nil)).
 		Set("status = ?", codeclarity.FAILURE).
+		Set("failure_reason = ?", msg).
 		Where("id = ?", analysisID).
 		Where("status IN (?)", bun.In([]string{
 			string(codeclarity.STARTED),
