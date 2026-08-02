@@ -9,6 +9,8 @@ services:
         - KIND=services
     image: codeclarityce/service-downloader-dev:latest
     restart: always
+    deploy:
+      replicas: 5
     volumes:
       - ../../backend:/codeclarity
       - ../../private:/private
