@@ -117,7 +117,18 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 		return nil
 	}
 
-	// Historical-commit analyses resolve in two tiers:
+	// Historical-commit analyses. The leaf directory is keyed by the commit, so
+	// a valid existing checkout IS the requested tree — left by a previous
+	// attempt, or by a concurrent analysis of another snapshot date that
+	// resolved to the same commit (stale repos pin many dates to one SHA).
+	// Reuse it instead of racing to re-clone it.
+	if checkedOutAt(ctx, destination, analysis.Commit) {
+		return nil
+	}
+
+	// Resolve in two tiers, working in a private temp dir promoted by an atomic
+	// rename — a half-finished clone is never visible at the leaf path, and
+	// concurrent same-commit attempts converge instead of clobbering each other:
 	//  1. Shallow-fetch the exact commit by SHA (GitHub serves reachable SHAs),
 	//     the cheap happy path — bounded by its own sub-deadline so a hung
 	//     attempt leaves budget for the fallback.
@@ -126,30 +137,55 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 	//     repos); checkout faults in only the requested commit's blobs. No -b
 	//     flag — fetching all refs resolves any reachable commit even if its
 	//     branch moved or was deleted.
-	shallowCtx, cancelShallow := context.WithTimeout(ctx, shallowFetchTimeout)
-	shallowErr := shallowFetchCommit(shallowCtx, url, analysis.Commit, destination)
-	cancelShallow()
-	if shallowErr == nil {
-		return nil
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return err
 	}
-	log.Printf("shallow fetch of %s failed (%s); falling back to blobless clone", analysis.Commit, shallowErr)
+	tmp, err := os.MkdirTemp(filepath.Dir(destination), filepath.Base(destination)+".tmp-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+
+	shallowCtx, cancelShallow := context.WithTimeout(ctx, shallowFetchTimeout)
+	shallowErr := shallowFetchCommit(shallowCtx, url, analysis.Commit, tmp)
+	cancelShallow()
+	if shallowErr != nil {
+		log.Printf("shallow fetch of %s failed (%s); falling back to blobless clone", analysis.Commit, shallowErr)
+		_ = os.RemoveAll(tmp)
+		if err := runGit(ctx, "", "clone", "--filter=blob:none", "--no-checkout", url, tmp); err != nil {
+			log.Println(err.Error())
+			return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
+		}
+		// Non-fatal: catches SHAs the server serves but that are not reachable from
+		// any advertised ref (e.g. force-pushed-away commits); the checkout below
+		// decides success either way.
+		if err := runGit(ctx, tmp, "fetch", "origin", analysis.Commit); err != nil {
+			log.Printf("fetch of %s by SHA failed (%s); trying checkout from cloned refs", analysis.Commit, err)
+		}
+		if err := runGit(ctx, tmp, "checkout", "--recurse-submodules", analysis.Commit); err != nil {
+			log.Println(err.Error())
+			return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
+		}
+	}
 
 	_ = os.RemoveAll(destination)
-	if err := runGit(ctx, "", "clone", "--filter=blob:none", "--no-checkout", url, destination); err != nil {
-		log.Println(err.Error())
-		return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
-	}
-	// Non-fatal: catches SHAs the server serves but that are not reachable from
-	// any advertised ref (e.g. force-pushed-away commits); the checkout below
-	// decides success either way.
-	if err := runGit(ctx, destination, "fetch", "origin", analysis.Commit); err != nil {
-		log.Printf("fetch of %s by SHA failed (%s); trying checkout from cloned refs", analysis.Commit, err)
-	}
-	if err := runGit(ctx, destination, "checkout", "--recurse-submodules", analysis.Commit); err != nil {
-		log.Println(err.Error())
+	if err := os.Rename(tmp, destination); err != nil {
+		// A concurrent attempt may have promoted its own checkout first — the
+		// leaf holding the right commit is success, whoever produced it.
+		if checkedOutAt(ctx, destination, analysis.Commit) {
+			return nil
+		}
 		return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
 	}
 	return nil
+}
+
+// checkedOutAt reports whether destination already holds a work tree whose
+// HEAD is exactly the wanted commit.
+func checkedOutAt(ctx context.Context, destination, commit string) bool {
+	cmd := exec.CommandContext(ctx, "git", "-C", destination, "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	return err == nil && strings.HasPrefix(strings.TrimSpace(string(out)), commit)
 }
 
 // shallowFetchCommit initialises a repo at destination and shallow-fetches
