@@ -76,7 +76,7 @@ func markAnalysisFailed(db *bun.DB, analysisID uuid.UUID, reason error) {
 		msg = string(r[:failureReasonMaxLen])
 	}
 	ctx := context.Background()
-	_, err := db.NewUpdate().
+	res, err := db.NewUpdate().
 		Model((*codeclarity.Analysis)(nil)).
 		Set("status = ?", codeclarity.FAILURE).
 		Set("failure_reason = ?", msg).
@@ -88,5 +88,21 @@ func markAnalysisFailed(db *bun.DB, analysisID uuid.UUID, reason error) {
 		Exec(ctx)
 	if err != nil {
 		log.Printf("[downloader] failed to mark analysis %s as FAILURE: %v", analysisID, err)
+		return
+	}
+	// The dispatcher can mark the analysis FAILURE first (its own failure path
+	// races this one); the guarded update above then matches nothing and the
+	// reason would be lost. Backfill the reason alone — never resurrect or
+	// overwrite a row that already carries one.
+	if n, _ := res.RowsAffected(); n == 0 {
+		if _, err := db.NewUpdate().
+			Model((*codeclarity.Analysis)(nil)).
+			Set("failure_reason = ?", msg).
+			Where("id = ?", analysisID).
+			Where("status = ?", codeclarity.FAILURE).
+			Where("failure_reason IS NULL").
+			Exec(ctx); err != nil {
+			log.Printf("[downloader] failed to backfill failure_reason for %s: %v", analysisID, err)
+		}
 	}
 }
