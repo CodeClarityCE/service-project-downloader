@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
@@ -35,6 +37,17 @@ const defaultDownloadTimeout = 600 * time.Second
 // fallback needs on large repos.
 const shallowFetchTimeout = 120 * time.Second
 
+// cacheLockPollInterval paces the non-blocking flock retry loop on the
+// per-project cache lock; polling (instead of a blocking flock) keeps the wait
+// cancellable by ctx so a replica can never leak a goroutine stuck in flock(2).
+const cacheLockPollInterval = 250 * time.Millisecond
+
+// defaultCacheFailureBackoff spaces out retries after a failed cache creation,
+// so a repo whose full history cannot be cloned within budget does not pay the
+// doomed multi-minute clone attempt again on every one of its ~19 snapshot
+// analyses (each one falls back to the direct-clone tiers immediately instead).
+const defaultCacheFailureBackoff = 30 * time.Minute
+
 // downloadTimeout returns the per-download deadline, overridable via
 // DOWNLOAD_TIMEOUT_SECONDS (seconds). Mirrors the env-override convention used
 // elsewhere (REAPER_INTERVAL, DB_MAX_OPEN_CONNS).
@@ -46,6 +59,18 @@ func downloadTimeout() time.Duration {
 		log.Printf("[downloader] invalid DOWNLOAD_TIMEOUT_SECONDS=%q, using default %s", v, defaultDownloadTimeout)
 	}
 	return defaultDownloadTimeout
+}
+
+// cacheFailureBackoff returns how long to skip cache attempts after a failed
+// cache creation, overridable via GIT_CACHE_FAILURE_BACKOFF_SECONDS (seconds).
+func cacheFailureBackoff() time.Duration {
+	if v := os.Getenv("GIT_CACHE_FAILURE_BACKOFF_SECONDS"); v != "" {
+		if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
+			return time.Duration(secs) * time.Second
+		}
+		log.Printf("[downloader] invalid GIT_CACHE_FAILURE_BACKOFF_SECONDS=%q, using default %s", v, defaultCacheFailureBackoff)
+	}
+	return defaultCacheFailureBackoff
 }
 
 // runGit runs a git command bounded by ctx, with interactive prompts disabled so
@@ -65,6 +90,24 @@ func runGit(ctx context.Context, dir string, args ...string) error {
 	)
 	cmd.Cancel = func() error { return cmd.Process.Kill() }
 	return cmd.Run()
+}
+
+// gitOutput runs a git command bounded by ctx and returns its trimmed stdout,
+// with the same prompt hardening as runGit (stderr passes through for logs).
+func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=true",
+		"GCM_INTERACTIVE=never",
+	)
+	cmd.Cancel = func() error { return cmd.Process.Kill() }
+	out, err := cmd.Output()
+	return strings.TrimSpace(string(out)), err
 }
 
 // Git clones a git project and checks out a specific branch or commit.
@@ -101,9 +144,21 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 		destination = fmt.Sprintf("%s/%s", destination, analysis.Commit)
 	}
 
-	// HEAD analyses: a shallow single-branch clone is far faster and smaller on
+	// Persistent per-project bare cache: the study corpus analyses each project
+	// at ~19 snapshots, and without it every snapshot re-transfers the repo.
+	// Try the cache first — HEAD analyses too, so branch runs share the same
+	// objects — and on ANY cache failure fall through to the direct-clone tiers
+	// below unchanged, so the cache can make downloads faster but never less
+	// reliable.
+	cacheBase := fmt.Sprintf("%s/%s/cache/%s", path, organization, project.Id)
+
+	// HEAD analyses: serve from the cache (fetch the branch tip, materialize at
+	// it); otherwise a shallow single-branch clone is far faster and smaller on
 	// large repos.
 	if analysis.Commit == "" || analysis.Commit == " " {
+		if err := tryCacheFirst(ctx, url, cacheBase, destination, "", analysis.Branch); err == nil {
+			return nil
+		}
 		if err := runGit(ctx, "", "clone", "--depth", "1", "--single-branch",
 			"--recurse-submodules", "--shallow-submodules", "-b", analysis.Branch, url, destination); err != nil {
 			log.Println(err.Error())
@@ -123,6 +178,10 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 	// resolved to the same commit (stale repos pin many dates to one SHA).
 	// Reuse it instead of racing to re-clone it.
 	if checkedOutAt(ctx, destination, analysis.Commit) {
+		return nil
+	}
+
+	if err := tryCacheFirst(ctx, url, cacheBase, destination, analysis.Commit, ""); err == nil {
 		return nil
 	}
 
@@ -208,6 +267,224 @@ func shallowFetchCommit(ctx context.Context, url, commit, destination string) er
 		}
 	}
 	return nil
+}
+
+// tryCacheFirst attempts to serve the analysis from the per-project bare cache
+// under a child deadline of half the remaining download budget, so even a slow
+// initial full-history clone can never starve the direct-clone fallback of the
+// time it needs to succeed on its own.
+func tryCacheFirst(ctx context.Context, url, cacheBase, destination, commit, branch string) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Until(deadline)/2)
+		defer cancel()
+	}
+	start := time.Now()
+	if err := materializeFromCache(ctx, url, cacheBase, destination, commit, branch); err != nil {
+		log.Printf("[downloader] git cache fallback cache=%s.git commit=%q branch=%q after=%s: %v",
+			cacheBase, commit, branch, time.Since(start).Round(time.Millisecond), err)
+		return err
+	}
+	return nil
+}
+
+// materializeFromCache serves one analysis from the persistent per-project
+// bare cache at {DOWNLOAD_PATH}/{org}/cache/{project}.git: ensure the cache
+// exists and holds the wanted rev (under a cross-process flock), then
+// materialize the leaf all-locally with a shared clone, promoted by the same
+// tmp+atomic-rename idiom as the direct tiers. commit=="" means HEAD analysis:
+// the branch tip is fetched and the leaf checked out on that branch.
+//
+// Empirically chosen over a blobless (--filter=blob:none) cache: a shared
+// borrower of a blobless cache has no promisor config, so checkout errors on
+// the missing blobs ("unable to read sha1 file"), and wiring a promisor into
+// the borrower makes every leaf re-fetch its blobs from the network into its
+// own objects — per-leaf transfer that defeats the cache. The full clone pays
+// one bigger initial transfer, then all ~19 materializations are network-free.
+func materializeFromCache(ctx context.Context, url, cacheBase, destination, commit, branch string) error {
+	gitDir := cacheBase + ".git"
+	marker := cacheBase + ".unavailable"
+
+	// A recent cache-creation failure backs off further attempts, so a repo
+	// whose history cannot be cloned within budget doesn't re-pay the doomed
+	// attempt on every snapshot analysis.
+	if fi, err := os.Stat(marker); err == nil && time.Since(fi.ModTime()) < cacheFailureBackoff() {
+		return fmt.Errorf("cache creation backoff since %s", fi.ModTime().UTC().Format(time.RFC3339))
+	}
+	if err := os.MkdirAll(filepath.Dir(gitDir), 0o755); err != nil {
+		return err
+	}
+	unlock, err := acquireCacheLock(ctx, cacheBase+".lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	ensureStart := time.Now()
+	created := false
+	if _, err := gitOutput(ctx, gitDir, "rev-parse", "--git-dir"); err != nil {
+		if err := createBareCache(ctx, url, gitDir); err != nil {
+			_ = os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)+" "+err.Error()+"\n"), 0o644)
+			return fmt.Errorf("cache creation: %w", err)
+		}
+		_ = os.Remove(marker)
+		created = true
+	}
+	fetched := false
+	sha := commit
+	if commit != "" {
+		// The full clone already carries every ref-reachable commit; fetch by
+		// SHA only on a miss (commit newer than the cache, or unreachable from
+		// advertised refs), pinned to a ref so it stays inspectable.
+		if runGit(ctx, gitDir, "cat-file", "-e", commit+"^{commit}") != nil {
+			if err := runGit(ctx, gitDir, "fetch", url, "+"+commit+":refs/snapshots/"+commit); err != nil {
+				return fmt.Errorf("cache fetch of %s: %w", commit, err)
+			}
+			fetched = true
+		}
+	} else {
+		// HEAD analysis: always refresh the branch tip (freshness is the
+		// contract), then materialize at exactly what was fetched. "fetched"
+		// reports whether the tip actually moved, so an unchanged branch still
+		// logs as a hit.
+		// --verify --quiet: a not-yet-fetched branch yields "" without log noise
+		// (plain rev-parse echoes the ref name and complains on stderr).
+		prevTip, _ := gitOutput(ctx, gitDir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
+		if err := runGit(ctx, gitDir, "fetch", url, "+refs/heads/"+branch+":refs/heads/"+branch); err != nil {
+			return fmt.Errorf("cache fetch of branch %s: %w", branch, err)
+		}
+		if sha, err = gitOutput(ctx, gitDir, "rev-parse", "refs/heads/"+branch); err != nil {
+			return fmt.Errorf("cache resolve of branch %s: %w", branch, err)
+		}
+		fetched = sha != prevTip
+	}
+	ensureDur := time.Since(ensureStart)
+
+	// Creation and fetches are the only cache mutations, so only they run under
+	// the lock; the shared-clone read below proceeds lock-free even against a
+	// concurrent fetch in another replica: git objects are immutable and
+	// append-only, ref updates are atomic (lockfile+rename), and gc/prune are
+	// disabled in the cache, so a reader can never observe an object vanishing.
+	// The one theoretical race — a replica re-creating a corrupt cache while
+	// another reads it — makes the reader's clone/checkout fail, which falls
+	// back to the direct-clone tiers.
+	unlock()
+
+	// The leaf may already hold the resolved rev (commit path: re-check after
+	// waiting on the lock; HEAD path: destination still at the fresh tip).
+	if checkedOutAt(ctx, destination, sha) {
+		log.Printf("[downloader] git cache hit (existing checkout) cache=%s rev=%s ensure=%s",
+			gitDir, sha, ensureDur.Round(time.Millisecond))
+		return nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp(filepath.Dir(destination), filepath.Base(destination)+".tmp-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	materializeStart := time.Now()
+	if err := runGit(ctx, "", "clone", "--shared", "--no-checkout", gitDir, tmp); err != nil {
+		return fmt.Errorf("cache shared clone: %w", err)
+	}
+	ref := commit
+	if commit == "" {
+		ref = branch
+	}
+	if err := runGit(ctx, tmp, "checkout", "--recurse-submodules", ref); err != nil {
+		return fmt.Errorf("cache checkout of %s: %w", ref, err)
+	}
+	_ = os.RemoveAll(destination)
+	if err := os.Rename(tmp, destination); err != nil {
+		// A concurrent attempt may have promoted its own checkout first — the
+		// leaf holding the right commit is success, whoever produced it.
+		if checkedOutAt(ctx, destination, sha) {
+			return nil
+		}
+		return fmt.Errorf("cache promote: %w", err)
+	}
+	log.Printf("[downloader] git cache %s cache=%s rev=%s created=%t fetched=%t ensure=%s materialize=%s",
+		map[bool]string{true: "miss", false: "hit"}[created || fetched], gitDir, sha, created, fetched,
+		ensureDur.Round(time.Millisecond), time.Since(materializeStart).Round(time.Millisecond))
+	return nil
+}
+
+// createBareCache builds the persistent bare cache with a full-history clone,
+// promoted atomically so a crashed clone never leaves a half-written cache
+// behind. gc is disabled because shared-clone leaves borrow the cache's object
+// store: any prune could delete objects a live leaf still references. The
+// origin remote is removed so the token-bearing URL is never persisted (and a
+// rotated token can't strand the cache); every fetch passes the current URL
+// explicitly instead. Caller must hold the project cache lock. On creation the
+// pack size is logged so the one-time transfer cost is visible next to the
+// per-analysis savings.
+func createBareCache(ctx context.Context, url, gitDir string) error {
+	tmp, err := os.MkdirTemp(filepath.Dir(gitDir), filepath.Base(gitDir)+".tmp-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	if err := runGit(ctx, "", "clone", "--bare", url, tmp); err != nil {
+		return err
+	}
+	for _, args := range [][]string{
+		{"config", "gc.auto", "0"},
+		{"config", "gc.pruneExpire", "never"},
+		{"remote", "remove", "origin"},
+	} {
+		if err := runGit(ctx, tmp, args...); err != nil {
+			return fmt.Errorf("git %s: %w", args[0], err)
+		}
+	}
+	if out, err := gitOutput(ctx, tmp, "count-objects", "-v"); err == nil {
+		for _, line := range strings.Split(out, "\n") {
+			if kib, ok := strings.CutPrefix(line, "size-pack: "); ok {
+				log.Printf("[downloader] git cache created cache=%s size-pack=%sKiB", gitDir, kib)
+			}
+		}
+	}
+	_ = os.RemoveAll(gitDir)
+	return os.Rename(tmp, gitDir)
+}
+
+// acquireCacheLock takes the cross-process per-project cache lock. flock is
+// used because replicas share {DOWNLOAD_PATH} on one volume (an in-memory
+// mutex would only serialize within a replica) and the kernel releases it if
+// the holder crashes, so a dead replica can never wedge a project. The lock is
+// polled non-blocking so ctx cancellation can't leak a thread stuck in
+// flock(2). The returned unlock is idempotent: call it early to end the
+// critical section, keep it deferred for error paths.
+func acquireCacheLock(ctx context.Context, lockPath string) (func(), error) {
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if err != syscall.EWOULDBLOCK {
+			f.Close()
+			return nil, err
+		}
+		select {
+		case <-ctx.Done():
+			f.Close()
+			return nil, ctx.Err()
+		case <-time.After(cacheLockPollInterval):
+		}
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			f.Close()
+		})
+	}, nil
 }
 
 // LanguageDetectionResult represents the result of language detection
