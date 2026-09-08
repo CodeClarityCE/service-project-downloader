@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -440,7 +441,7 @@ func createBareCache(ctx context.Context, url, gitDir string) error {
 		}
 	}
 	if out, err := gitOutput(ctx, tmp, "count-objects", "-v"); err == nil {
-		for _, line := range strings.Split(out, "\n") {
+		for line := range strings.SplitSeq(out, "\n") {
 			if kib, ok := strings.CutPrefix(line, "size-pack: "); ok {
 				log.Printf("[downloader] git cache created cache=%s size-pack=%sKiB", gitDir, kib)
 			}
@@ -572,10 +573,5 @@ func fileExists(path string) bool {
 
 // contains checks if a slice contains a string
 func contains(slice []string, item string) bool {
-	for _, s := range slice {
-		if s == item {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(slice, item)
 }
