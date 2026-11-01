@@ -29,6 +29,11 @@ import (
 // }
 
 func TestMain(t *testing.T) {
+	// Integration test: it starts the real downloader service, which needs
+	// Postgres (PG_DB_*) and a RabbitMQ broker. CI provides neither.
+	if os.Getenv("PG_DB_HOST") == "" {
+		t.Skip("integration test: set PG_DB_* and run a RabbitMQ broker to enable")
+	}
 	os.Setenv("AMQP_PROTOCOL", "amqp")
 	os.Setenv("AMQP_HOST", "localhost")
 	os.Setenv("AMQP_PORT", "5672")
