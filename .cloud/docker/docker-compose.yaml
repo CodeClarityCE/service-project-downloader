@@ -9,6 +9,8 @@ services:
         - KIND=services
     image: codeclarityce/service-downloader-dev:latest
     restart: always
+    deploy:
+      replicas: 8
     volumes:
       - ../../backend:/codeclarity
       - ../../private:/private
@@ -21,6 +23,10 @@ services:
         condition: service_started
     env_file:
       - ../../.cloud/env/.env.dev
+    environment:
+      # Literal value: `environment:` ${VAR} interpolation reads the host shell,
+      # not the service's env_file.
+      - DOWNLOAD_TIMEOUT_SECONDS=900
 
 volumes:
   projects:

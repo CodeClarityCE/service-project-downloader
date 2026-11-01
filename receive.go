@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -25,17 +27,20 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 		var apiMessage types_amqp.DispatcherDownloaderMessage
 		json.Unmarshal([]byte(d.Body), &apiMessage)
 
-		// Get info
+		// Get info. A failed analysis load is left non-terminal so the dispatcher's
+		// reaper retries it (the load itself may be a transient DB hiccup); every
+		// later error is a terminal download failure and marks the analysis FAILURE
+		// so the reaper stops re-driving it.
 		analysis_info, err := getAnalysis(service.DB.CodeClarity, apiMessage.AnalysisId)
 		if err != nil {
-			log.Printf("%v", err)
-			// TODO: Send error message
+			log.Printf("Failed to load analysis %s: %v", apiMessage.AnalysisId, err)
 			return
 		}
 
 		project_info, err := getProject(service.DB.CodeClarity, *analysis_info.ProjectId)
 		if err != nil {
-			log.Printf("%v", err)
+			log.Printf("Failed to load project for analysis %s: %v", apiMessage.AnalysisId, err)
+			markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, err)
 			return
 		}
 
@@ -46,7 +51,7 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 			err = Archive(analysis_info, project_info, apiMessage.OrganizationId)
 			if err != nil {
 				log.Printf("Failed to extract archive: %v", err)
-				// TODO Send error message
+				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, err)
 				return
 			}
 		} else {
@@ -54,14 +59,19 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 			log.Printf("Processing VCS project: %s (type: %s)", project_info.Id, project_info.Type)
 			integration_info, err := getIntegration(service.DB.CodeClarity, apiMessage.IntegrationId)
 			if err != nil {
-				log.Printf("%v", err)
+				log.Printf("Failed to load integration for analysis %s: %v", apiMessage.AnalysisId, err)
+				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, err)
 				return
 			}
 
 			err = Git(analysis_info, project_info, integration_info, apiMessage.OrganizationId)
 			if err != nil {
-				log.Printf("Failed to clone repository: %v", err)
-				// TODO Send error message
+				if errors.Is(err, ErrCommitUnresolvable) || errors.Is(err, context.DeadlineExceeded) {
+					log.Printf("[downloader] analysis %s: commit unresolvable/timed out, failing: %v", apiMessage.AnalysisId, err)
+				} else {
+					log.Printf("[downloader] analysis %s: download failed: %v", apiMessage.AnalysisId, err)
+				}
+				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, err)
 				return
 			}
 		}
