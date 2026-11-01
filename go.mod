@@ -1,6 +1,6 @@
 module github.com/CodeClarityCE/service-project-downloader
 
-go 1.27.1
+go 1.27.3
 
 require (
 	github.com/CodeClarityCE/utility-boilerplates v0.0.7-alpha
