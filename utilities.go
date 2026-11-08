@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
@@ -57,9 +58,17 @@ func getIntegration(db *bun.DB, integrationID uuid.UUID) (codeclarity.Integratio
 	return *integration_document, nil
 }
 
-// failureReasonMaxLen matches the API's varchar(500) failure_reason column;
-// reasons are truncated so an arbitrarily long git error cannot overflow it.
-const failureReasonMaxLen = 500
+// downloadFailureReason turns a git error into text safe to show; details stay in the logs.
+func downloadFailureReason(err error) string {
+	switch {
+	case errors.Is(err, ErrCommitUnresolvable):
+		return "the requested commit could not be found in the repository"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "the repository download timed out"
+	default:
+		return "the repository could not be downloaded; check that it exists and that the integration can access it"
+	}
+}
 
 // markAnalysisFailed sets a non-terminal analysis to FAILURE and persists why
 // (failure_reason) in the same UPDATE, so callers polling the analysis can
@@ -68,18 +77,13 @@ const failureReasonMaxLen = 500
 // reaper from re-driving it forever (the recovery loop is bounded by this write).
 // The status guard keeps it idempotent and avoids clobbering an already-terminal
 // row. Failures are logged, not propagated: the message is dropped either way.
-func markAnalysisFailed(db *bun.DB, analysisID uuid.UUID, reason error) {
-	msg := reason.Error()
-	// Truncate by runes, not bytes: varchar(500) counts characters, and a
-	// byte-level cut could split a multi-byte character into invalid UTF-8.
-	if r := []rune(msg); len(r) > failureReasonMaxLen {
-		msg = string(r[:failureReasonMaxLen])
-	}
+func markAnalysisFailed(db *bun.DB, analysisID uuid.UUID, reason string) {
+	msg := codeclarity.SanitizeFailureReason(reason)
 	ctx := context.Background()
 	res, err := db.NewUpdate().
 		Model((*codeclarity.Analysis)(nil)).
 		Set("status = ?", codeclarity.FAILURE).
-		Set("failure_reason = ?", msg).
+		Set("failure_reason = COALESCE(failure_reason, ?)", msg).
 		Where("id = ?", analysisID).
 		Where("status IN (?)", bun.In([]string{
 			string(codeclarity.STARTED),
