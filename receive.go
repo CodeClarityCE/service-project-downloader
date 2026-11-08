@@ -4,14 +4,29 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
 	"github.com/CodeClarityCE/utility-boilerplates"
 	types_amqp "github.com/CodeClarityCE/utility-types/amqp"
+	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
+	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
+
+// projectSourcePath returns where a project's files were placed for this analysis.
+// FILE projects extract to the branch directory even when a commit is set.
+func projectSourcePath(downloadPath string, organization uuid.UUID, project codeclarity.Project, analysis codeclarity.Analysis) string {
+	folder := analysis.Commit
+	if project.Type == "FILE" {
+		folder = archiveBranch(analysis)
+		downloadPath = archiveRoot(downloadPath)
+	} else if folder == "" || folder == " " {
+		folder = analysis.Branch
+	}
+	return filepath.Join(downloadPath, organization.String(), "projects", project.Id.String(), folder)
+}
 
 // dispatch is a function that handles the received message from the "dispatcher_downloader" connection.
 // It reads the message from the API, retrieves analysis, project, and integration information,
@@ -78,13 +93,7 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 
 		// Detect languages from the downloaded repository
 		// Build the project path where the repository was cloned
-		path := os.Getenv("DOWNLOAD_PATH")
-		destination := fmt.Sprintf("%s/%s/%s/%s", path, apiMessage.OrganizationId, "projects", project_info.Id)
-		if analysis_info.Commit == "" || analysis_info.Commit == " " {
-			destination = fmt.Sprintf("%s/%s", destination, analysis_info.Branch)
-		} else {
-			destination = fmt.Sprintf("%s/%s", destination, analysis_info.Commit)
-		}
+		destination := projectSourcePath(os.Getenv("DOWNLOAD_PATH"), apiMessage.OrganizationId, project_info, analysis_info)
 
 		languageResult := detectLanguagesFromRepository(destination)
 

@@ -15,15 +15,28 @@ import (
 	"github.com/google/uuid"
 )
 
+// archiveRoot returns the base directory for FILE projects.
+func archiveRoot(downloadPath string) string {
+	if downloadPath == "" {
+		return "/private"
+	}
+	return downloadPath
+}
+
+// archiveBranch names the directory a FILE project is extracted into.
+func archiveBranch(analysis codeclarity.Analysis) string {
+	if analysis.Branch == "" {
+		return "main"
+	}
+	return analysis.Branch
+}
+
 // Archive extracts uploaded archives to the project directory.
 // It handles both ZIP and TAR.GZ formats.
 // Files are extracted to the same destination structure as Git clones:
 // {DOWNLOAD_PATH}/{organization_id}/projects/{project_id}/{branch}
 func Archive(analysis codeclarity.Analysis, project codeclarity.Project, organization uuid.UUID) error {
-	path := os.Getenv("DOWNLOAD_PATH")
-	if path == "" {
-		path = "/private"
-	}
+	path := archiveRoot(os.Getenv("DOWNLOAD_PATH"))
 
 	// Find the uploaded archive file
 	// Files are stored at: {DOWNLOAD_PATH}/{user_id}/{project_id}/{filename}
@@ -36,10 +49,7 @@ func Archive(analysis codeclarity.Analysis, project codeclarity.Project, organiz
 
 	// Destination: same structure as Git clones
 	// {DOWNLOAD_PATH}/{organization_id}/projects/{project_id}/{branch}
-	branch := analysis.Branch
-	if branch == "" {
-		branch = "main" // Default branch name for FILE projects
-	}
+	branch := archiveBranch(analysis)
 
 	destination := filepath.Join(path, organization.String(), "projects", project.Id.String(), branch)
 
