@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
@@ -13,6 +14,7 @@ import (
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/sirupsen/logrus"
 )
 
 // projectSourcePath returns where a project's files were placed for this analysis.
@@ -47,8 +49,16 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 		// later error is a terminal download failure and marks the analysis FAILURE
 		// so the reaper stops re-driving it.
 		analysis_info, err := getAnalysis(service.DB.CodeClarity, apiMessage.AnalysisId)
+		if errors.Is(err, sql.ErrNoRows) {
+			logSkipped(service, apiMessage.AnalysisId, "the analysis was deleted")
+			return
+		}
 		if err != nil {
 			log.Printf("Failed to load analysis %s: %v", apiMessage.AnalysisId, err)
+			return
+		}
+		if analysis_info.Status == codeclarity.CANCELLED {
+			logSkipped(service, apiMessage.AnalysisId, "the analysis was cancelled")
 			return
 		}
 
@@ -114,4 +124,9 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 		}
 	}
 
+}
+
+// logSkipped records that a download was not started because its analysis is gone or cancelled.
+func logSkipped(service *boilerplates.ServiceBase, analysisId uuid.UUID, reason string) {
+	service.LogInfo("Skipping download: "+reason, logrus.Fields{"analysis_id": analysisId.String()})
 }
