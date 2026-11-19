@@ -15,9 +15,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/CodeClarityCE/utility-boilerplates"
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
+	"github.com/sirupsen/logrus"
 )
 
 // ErrCommitUnresolvable is returned when a historical-commit analysis cannot be
@@ -498,20 +500,11 @@ type LanguageDetectionResult struct {
 // detectLanguagesFromRepository scans the downloaded repository to detect programming languages
 // based on manifest files and file extensions
 func detectLanguagesFromRepository(projectPath string) LanguageDetectionResult {
-	detectedLanguages := []string{}
-
-	// Check for JavaScript/Node.js
-	if fileExists(filepath.Join(projectPath, "package.json")) ||
-		fileExists(filepath.Join(projectPath, "package-lock.json")) ||
-		fileExists(filepath.Join(projectPath, "yarn.lock")) ||
-		fileExists(filepath.Join(projectPath, "pnpm-lock.yaml")) {
-		detectedLanguages = append(detectedLanguages, "javascript")
-	}
-
-	// Check for PHP
-	if fileExists(filepath.Join(projectPath, "composer.json")) ||
-		fileExists(filepath.Join(projectPath, "composer.lock")) {
-		detectedLanguages = append(detectedLanguages, "php")
+	// The root's manifests, else the subfolders that have a manifest and a lockfile.
+	folders := boilerplates.ScanProjectFolders(projectPath)
+	detectedLanguages := folders.Languages()
+	if len(folders.Skipped) > 0 {
+		logrus.WithFields(logrus.Fields{"project_path": projectPath, "skipped_folders": folders.Skipped}).Info("Language detection skipped folders")
 	}
 
 	// Determine primary language based on priority and manifest files
