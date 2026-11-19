@@ -19,6 +19,7 @@ import (
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
+	"github.com/sirupsen/logrus"
 )
 
 // ErrCommitUnresolvable is returned when a historical-commit analysis cannot be
@@ -503,7 +504,7 @@ func detectLanguagesFromRepository(projectPath string) LanguageDetectionResult {
 	folders := boilerplates.ScanProjectFolders(projectPath)
 	detectedLanguages := folders.Languages()
 	if len(folders.Skipped) > 0 {
-		log.Printf("Language detection for project %s: skipped folders %v", projectPath, folders.Skipped)
+		logrus.WithFields(logrus.Fields{"project_path": projectPath, "skipped_folders": folders.Skipped}).Info("Language detection skipped folders")
 	}
 
 	// Determine primary language based on priority and manifest files
