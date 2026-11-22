@@ -126,6 +126,7 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 	// rather than wedging the serial consumer.
 	ctx, cancel := context.WithTimeout(context.Background(), downloadTimeout())
 	defer cancel()
+	logger := logrus.WithFields(logrus.Fields{"analysis_id": analysis.Id.String(), "project_id": project.Id.String()})
 
 	// Clone git project
 	url := ""
@@ -164,11 +165,11 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 		}
 		if err := runGit(ctx, "", "clone", "--depth", "1", "--single-branch",
 			"--recurse-submodules", "--shallow-submodules", "-b", analysis.Branch, url, destination); err != nil {
-			logrus.WithError(err).Warn("Shallow clone failed, trying a pull")
+			logger.WithError(err).Warn("Shallow clone failed, trying a pull")
 			// The destination may already exist from a previous run — try to
 			// refresh it in place rather than failing outright.
 			if err2 := runGit(ctx, destination, "pull"); err2 != nil {
-				logrus.WithError(err2).Warn("Pull failed")
+				logger.WithError(err2).Warn("Pull failed")
 				return err
 			}
 		}
@@ -215,7 +216,7 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 		log.Printf("shallow fetch of %s failed (%s); falling back to blobless clone", analysis.Commit, shallowErr)
 		_ = os.RemoveAll(tmp)
 		if err := runGit(ctx, "", "clone", "--filter=blob:none", "--no-checkout", url, tmp); err != nil {
-			logrus.WithError(err).Warn("Blobless clone failed")
+			logger.WithError(err).Warn("Blobless clone failed")
 			return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
 		}
 		// Non-fatal: catches SHAs the server serves but that are not reachable from
