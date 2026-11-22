@@ -13,6 +13,7 @@ import (
 
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
+	"github.com/sirupsen/logrus"
 )
 
 // archiveRoot returns the base directory for FILE projects.
@@ -54,11 +55,11 @@ func Archive(analysis codeclarity.Analysis, project codeclarity.Project, organiz
 	destination := filepath.Join(path, organization.String(), "projects", project.Id.String(), branch)
 
 	// Create destination directory
-	if err := os.MkdirAll(destination, 0755); err != nil {
+	if err := os.MkdirAll(destination, sharedDirMode); err != nil {
 		return fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
-	log.Printf("Extracting archive to: %s", destination)
+	logrus.WithField("destination", destination).Info("Extracting archive")
 
 	// Detect format and extract
 	lowerPath := strings.ToLower(sourcePath)
@@ -91,12 +92,8 @@ func findUploadedArchive(basePath string, project codeclarity.Project) (string, 
 			continue
 		}
 
-		// Check if this directory contains the project folder
+		// A user directory without this project's folder fails the read and is skipped.
 		projectPath := filepath.Join(basePath, entry.Name(), project.Id.String())
-		if _, err := os.Stat(projectPath); os.IsNotExist(err) {
-			continue
-		}
-
 		archivePath, err := findArchiveInDirectory(projectPath)
 		if err == nil {
 			return archivePath, nil
@@ -131,61 +128,92 @@ func findArchiveInDirectory(dirPath string) (string, error) {
 	return "", fmt.Errorf("no archive found in directory %s", dirPath)
 }
 
+// sharedDirMode is the mode of directories on the download volume, which plugin
+// containers running as other users read.
+const sharedDirMode os.FileMode = 0o755
+
+// extraction writes archive entries under one root, so no entry can land outside it.
+type extraction struct {
+	root  *os.Root
+	files int
+}
+
+// entryPath strips the single root directory and rejects names that leave the destination.
+func entryPath(name, stripPrefix string) (string, bool, error) {
+	if stripPrefix != "" {
+		name = strings.TrimPrefix(name, stripPrefix)
+	}
+	name = strings.TrimLeft(name, "/")
+	if name == "" {
+		return "", false, nil
+	}
+	rel := filepath.FromSlash(name)
+	if !filepath.IsLocal(rel) {
+		return "", false, fmt.Errorf("illegal file path: %s", name)
+	}
+	return rel, true, nil
+}
+
+func (x *extraction) dir(rel string) error {
+	return x.root.MkdirAll(rel, sharedDirMode)
+}
+
+// file copies r to rel.
+func (x *extraction) file(rel string, mode os.FileMode, r io.Reader) error {
+	if err := x.root.MkdirAll(filepath.Dir(rel), sharedDirMode); err != nil {
+		return err
+	}
+	out, err := x.root.OpenFile(rel, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode.Perm())
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, r)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	x.files++
+	return closeErr
+}
+
 // extractZip extracts a ZIP archive to the destination directory.
 func extractZip(src, dest string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
 		return fmt.Errorf("failed to open zip file: %w", err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
+
+	root, err := os.OpenRoot(dest)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	x := &extraction{root: root}
 
 	// Determine if there's a single top-level directory to strip
 	stripPrefix := detectSingleRootDir(r.File)
 
 	for _, f := range r.File {
-		// Get the path, potentially stripping the root directory
-		fpath := f.Name
-		if stripPrefix != "" && strings.HasPrefix(fpath, stripPrefix) {
-			fpath = strings.TrimPrefix(fpath, stripPrefix)
-			if fpath == "" {
-				continue // Skip the root directory itself
-			}
+		rel, ok, err := entryPath(f.Name, stripPrefix)
+		if err != nil {
+			return err
 		}
-
-		fpath = filepath.Join(dest, fpath)
-
-		// Check for ZipSlip (directory traversal vulnerability)
-		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
-			return fmt.Errorf("illegal file path: %s", fpath)
+		if !ok {
+			continue // Skip the root directory itself
 		}
-
 		if f.FileInfo().IsDir() {
-			if err := os.MkdirAll(fpath, os.ModePerm); err != nil {
+			if err := x.dir(rel); err != nil {
 				return err
 			}
 			continue
 		}
-
-		// Create parent directories
-		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
-			return err
-		}
-
-		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
-		if err != nil {
-			return err
-		}
-
 		rc, err := f.Open()
 		if err != nil {
-			outFile.Close()
 			return err
 		}
-
-		_, err = io.Copy(outFile, rc)
-		outFile.Close()
-		rc.Close()
-
+		err = x.file(rel, f.Mode(), rc)
+		_ = rc.Close()
 		if err != nil {
 			return err
 		}
@@ -195,39 +223,47 @@ func extractZip(src, dest string) error {
 	return nil
 }
 
+// tarRootPrefix reads the archive once to find a single root directory to strip,
+// then rewinds the file.
+func tarRootPrefix(file *os.File) (string, error) {
+	gzr, err := gzip.NewReader(file)
+	if err != nil {
+		return "", fmt.Errorf("failed to create gzip reader: %w", err)
+	}
+	prefix := detectSingleRootDirTar(tar.NewReader(gzr))
+	_ = gzr.Close()
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
+	return prefix, nil
+}
+
 // extractTarGz extracts a TAR.GZ archive to the destination directory.
 func extractTarGz(src, dest string) error {
-	file, err := os.Open(src)
+	file, err := os.Open(src) //nolint:gosec // G304: path found by listing the upload directory
 	if err != nil {
 		return fmt.Errorf("failed to open tar.gz file: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
+	stripPrefix, err := tarRootPrefix(file)
+	if err != nil {
+		return err
+	}
 	gzr, err := gzip.NewReader(file)
 	if err != nil {
 		return fmt.Errorf("failed to create gzip reader: %w", err)
 	}
-	defer gzr.Close()
-
+	defer func() { _ = gzr.Close() }()
 	tr := tar.NewReader(gzr)
 
-	// First pass: detect if there's a single root directory
-	file.Seek(0, 0)
-	gzrDetect, _ := gzip.NewReader(file)
-	trDetect := tar.NewReader(gzrDetect)
-	stripPrefix := detectSingleRootDirTar(trDetect)
-	gzrDetect.Close()
-
-	// Reset and re-read
-	file.Seek(0, 0)
-	gzr2, err := gzip.NewReader(file)
+	root, err := os.OpenRoot(dest)
 	if err != nil {
-		return fmt.Errorf("failed to create gzip reader: %w", err)
+		return err
 	}
-	defer gzr2.Close()
-	tr = tar.NewReader(gzr2)
+	defer func() { _ = root.Close() }()
+	x := &extraction{root: root}
 
-	fileCount := 0
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -237,48 +273,27 @@ func extractTarGz(src, dest string) error {
 			return fmt.Errorf("failed to read tar entry: %w", err)
 		}
 
-		// Get the path, potentially stripping the root directory
-		fpath := header.Name
-		if stripPrefix != "" && strings.HasPrefix(fpath, stripPrefix) {
-			fpath = strings.TrimPrefix(fpath, stripPrefix)
-			if fpath == "" {
-				continue // Skip the root directory itself
-			}
+		rel, ok, err := entryPath(header.Name, stripPrefix)
+		if err != nil {
+			return err
 		}
-
-		fpath = filepath.Join(dest, fpath)
-
-		// Check for directory traversal vulnerability
-		if !strings.HasPrefix(fpath, filepath.Clean(dest)+string(os.PathSeparator)) {
-			return fmt.Errorf("illegal file path: %s", fpath)
+		if !ok {
+			continue // Skip the root directory itself
 		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(fpath, os.ModePerm); err != nil {
+			if err := x.dir(rel); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			// Create parent directories
-			if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+			if err := x.file(rel, header.FileInfo().Mode(), tr); err != nil {
 				return err
 			}
-
-			outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.FileMode(header.Mode))
-			if err != nil {
-				return err
-			}
-
-			if _, err := io.Copy(outFile, tr); err != nil {
-				outFile.Close()
-				return err
-			}
-			outFile.Close()
-			fileCount++
 		}
 	}
 
-	log.Printf("Successfully extracted TAR.GZ archive: %d files", fileCount)
+	log.Printf("Successfully extracted TAR.GZ archive: %d files", x.files)
 	return nil
 }
 

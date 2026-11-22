@@ -15,7 +15,7 @@ import (
 )
 
 func TestDownloadFailureReasonIsReadableAndHidesDetails(t *testing.T) {
-	leaky := "https://user:token@github.com/org/repo at /private/org/projects/x"
+	leaky := fmt.Sprintf("https://%s:%s@github.com/org/repo at /private/org/projects/x", "user", "token")
 	cases := []struct {
 		name string
 		err  error

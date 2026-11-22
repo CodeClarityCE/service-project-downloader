@@ -42,7 +42,10 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 	if connection == "dispatcher_downloader" { // If message is from dispatcher
 		// Read message from API
 		var apiMessage types_amqp.DispatcherDownloaderMessage
-		json.Unmarshal([]byte(d.Body), &apiMessage)
+		if err := json.Unmarshal(d.Body, &apiMessage); err != nil {
+			log.Printf("Dropping a malformed dispatcher message: %v", err)
+			return
+		}
 
 		// Get info. A failed analysis load is left non-terminal so the dispatcher's
 		// reaper retries it (the load itself may be a transient DB hiccup); every

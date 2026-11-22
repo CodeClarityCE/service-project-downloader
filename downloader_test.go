@@ -34,12 +34,12 @@ func TestMain(t *testing.T) {
 	if os.Getenv("PG_DB_HOST") == "" {
 		t.Skip("integration test: set PG_DB_* and run a RabbitMQ broker to enable")
 	}
-	os.Setenv("AMQP_PROTOCOL", "amqp")
-	os.Setenv("AMQP_HOST", "localhost")
-	os.Setenv("AMQP_PORT", "5672")
-	os.Setenv("AMQP_USER", "guest")
-	os.Setenv("AMQP_PASSWORD", "guest")
-	os.Setenv("DOWNLOAD_PATH", "/tmp")
+	t.Setenv("AMQP_PROTOCOL", "amqp")
+	t.Setenv("AMQP_HOST", "localhost")
+	t.Setenv("AMQP_PORT", "5672")
+	t.Setenv("AMQP_USER", "guest")
+	t.Setenv("AMQP_PASSWORD", "guest")
+	t.Setenv("DOWNLOAD_PATH", "/tmp")
 
 	// Test now uses ServiceBase instead of legacy receiveMessage
 	service, err := CreateDownloaderService()
