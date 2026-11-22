@@ -293,7 +293,7 @@ func extractTarGz(src, dest string) error {
 		}
 	}
 
-	log.Printf("Successfully extracted TAR.GZ archive: %d files", x.files)
+	logrus.WithField("files", x.files).Info("Extracted TAR.GZ archive")
 	return nil
 }
 

@@ -43,7 +43,7 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 		// Read message from API
 		var apiMessage types_amqp.DispatcherDownloaderMessage
 		if err := json.Unmarshal(d.Body, &apiMessage); err != nil {
-			log.Printf("Dropping a malformed dispatcher message: %v", err)
+			logrus.WithError(err).Warn("Dropping a malformed dispatcher message")
 			return
 		}
 
