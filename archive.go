@@ -37,6 +37,10 @@ func archiveBranch(analysis codeclarity.Analysis) string {
 // Files are extracted to the same destination structure as Git clones:
 // {DOWNLOAD_PATH}/{organization_id}/projects/{project_id}/{branch}
 func Archive(analysis codeclarity.Analysis, project codeclarity.Project, organization uuid.UUID) error {
+	branch := archiveBranch(analysis)
+	if err := validateRevision(codeclarity.Analysis{}, branch); err != nil {
+		return err
+	}
 	path := archiveRoot(os.Getenv("DOWNLOAD_PATH"))
 
 	// Find the uploaded archive file
@@ -50,12 +54,10 @@ func Archive(analysis codeclarity.Analysis, project codeclarity.Project, organiz
 
 	// Destination: same structure as Git clones
 	// {DOWNLOAD_PATH}/{organization_id}/projects/{project_id}/{branch}
-	branch := archiveBranch(analysis)
-
 	destination := filepath.Join(path, organization.String(), "projects", project.Id.String(), branch)
 
 	// Create destination directory
-	if err := os.MkdirAll(destination, sharedDirMode); err != nil {
+	if err := os.MkdirAll(destination, sharedDirMode); err != nil { //nolint:gosec // G703: DOWNLOAD_PATH is operator config; the rest is UUIDs and a validated branch
 		return fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
