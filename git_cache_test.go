@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CodeClarityCE/utility-boilerplates/testdeps"
 	codeclarity "github.com/CodeClarityCE/utility-types/codeclarity_db"
 	"github.com/google/uuid"
 )
@@ -22,12 +23,11 @@ const (
 	cacheTestSHA2 = "87310da049cc2361ece0273daef7e5e46dc6d3f5"
 )
 
-// requireRemote skips network-dependent tests when the git mirror is not
-// reachable, so the suite stays runnable offline.
+// requireRemote skips network-dependent tests offline and fails them in CI.
 func requireRemote(t *testing.T) {
 	t.Helper()
 	if err := exec.Command("git", "ls-remote", cacheTestURL, "HEAD").Run(); err != nil {
-		t.Skipf("git mirror %s not reachable: %v", cacheTestURL, err)
+		testdeps.Unavailable(t, "git mirror "+cacheTestURL, err)
 	}
 }
 
