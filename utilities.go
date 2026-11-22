@@ -63,6 +63,8 @@ func downloadFailureReason(err error) string {
 	switch {
 	case errors.Is(err, ErrCommitUnresolvable):
 		return "the requested commit could not be found in the repository"
+	case errors.Is(err, ErrInvalidRevision):
+		return "the requested branch or commit is not a valid name"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "the repository download timed out"
 	default:
@@ -85,7 +87,7 @@ func markAnalysisFailed(db *bun.DB, analysisID uuid.UUID, reason string) {
 		Set("status = ?", codeclarity.FAILURE).
 		Set("failure_reason = COALESCE(failure_reason, ?)", msg).
 		Where("id = ?", analysisID).
-		Where("status IN (?)", bun.In([]string{
+		Where("status IN (?)", bun.List([]string{
 			string(codeclarity.STARTED),
 			string(codeclarity.ONGOING),
 		})).
