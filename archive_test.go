@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -170,6 +171,22 @@ func TestExtractDoesNotWriteThroughSymlinks(t *testing.T) {
 			_ = x.extract(src, dest)
 			if _, err := os.Stat(filepath.Join(outside, "pwned")); err == nil {
 				t.Error("an entry was written through a symlink outside the destination")
+			}
+		})
+	}
+}
+
+func TestExtractStopsAtSizeCap(t *testing.T) {
+	old := maxExtractedBytes
+	maxExtractedBytes = 1024
+	t.Cleanup(func() { maxExtractedBytes = old })
+	for _, x := range extractors {
+		t.Run(x.name, func(t *testing.T) {
+			src := filepath.Join(t.TempDir(), "upload"+x.ext)
+			dest := t.TempDir()
+			x.write(t, src, []entry{{name: "a", body: strings.Repeat("0", 600)}, {name: "b", body: strings.Repeat("0", 600)}})
+			if err := x.extract(src, dest); err == nil {
+				t.Error("extract accepted an archive larger than the cap")
 			}
 		})
 	}
