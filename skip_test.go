@@ -90,17 +90,16 @@ func downloadFor(t *testing.T, analysis map[string]string, analysisId, projectId
 	downloadPath = t.TempDir()
 	t.Setenv("DOWNLOAD_PATH", downloadPath)
 	uploadDir := filepath.Join(downloadPath, uuid.NewString(), projectId.String())
-	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+	if err := os.MkdirAll(uploadDir, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	upload, err := os.Create(filepath.Join(uploadDir, "upload.zip"))
-	if err != nil {
+	var upload bytes.Buffer
+	if err := zip.NewWriter(&upload).Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := zip.NewWriter(upload).Close(); err != nil {
+	if err := os.WriteFile(filepath.Join(uploadDir, "upload.zip"), upload.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	upload.Close()
 
 	rows := map[string]map[string]string{
 		"project": {"id": projectId.String(), "type": "FILE"},

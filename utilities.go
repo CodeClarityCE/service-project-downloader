@@ -85,7 +85,7 @@ func markAnalysisFailed(db *bun.DB, analysisID uuid.UUID, reason string) {
 		Set("status = ?", codeclarity.FAILURE).
 		Set("failure_reason = COALESCE(failure_reason, ?)", msg).
 		Where("id = ?", analysisID).
-		Where("status IN (?)", bun.In([]string{
+		Where("status IN (?)", bun.List([]string{
 			string(codeclarity.STARTED),
 			string(codeclarity.ONGOING),
 		})).

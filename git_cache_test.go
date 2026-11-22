@@ -82,7 +82,8 @@ func TestGitCacheMaterialize(t *testing.T) {
 	}
 
 	// The token-bearing URL must not be persisted in the cache config.
-	if cfg, _ := os.ReadFile(filepath.Join(cacheBase+".git", "config")); strings.Contains(string(cfg), "github.com") {
+	cfg, _ := os.ReadFile(filepath.Join(cacheBase+".git", "config")) //nolint:gosec // G304: the test's own temp cache
+	if strings.Contains(string(cfg), "github.com") {
 		t.Fatalf("cache config persists a remote URL:\n%s", cfg)
 	}
 }
@@ -90,10 +91,10 @@ func TestGitCacheMaterialize(t *testing.T) {
 func TestGitCacheFailureBackoff(t *testing.T) {
 	base := t.TempDir()
 	cacheBase := filepath.Join(base, "cache", "project-2")
-	if err := os.MkdirAll(filepath.Dir(cacheBase), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cacheBase), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(cacheBase+".unavailable", []byte("test\n"), 0o644); err != nil {
+	if err := os.WriteFile(cacheBase+".unavailable", []byte("test\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

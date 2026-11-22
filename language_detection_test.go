@@ -13,10 +13,10 @@ func layout(t *testing.T, files ...string) string {
 	root := t.TempDir()
 	for _, f := range files {
 		path := filepath.Join(root, f)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
