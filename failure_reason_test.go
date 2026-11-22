@@ -22,6 +22,7 @@ func TestDownloadFailureReasonIsReadableAndHidesDetails(t *testing.T) {
 		want string
 	}{
 		{"unknown commit", fmt.Errorf("%w: commit abc in %s: exit 128", ErrCommitUnresolvable, leaky), "the requested commit could not be found in the repository"},
+		{"invalid revision", fmt.Errorf("%w: branch %q in %s", ErrInvalidRevision, "../x", leaky), "the requested branch or commit is not a valid name"},
 		{"timeout", fmt.Errorf("git clone %s: %w", leaky, context.DeadlineExceeded), "the repository download timed out"},
 		{"other git error", fmt.Errorf("git clone %s: exit status 128", leaky), "the repository could not be downloaded; check that it exists and that the integration can access it"},
 	}

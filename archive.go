@@ -16,6 +16,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// maxExtractedBytes caps the total size an archive may expand to (uploads are at most 25 MB).
+var maxExtractedBytes int64 = 2 << 30
+
 // archiveRoot returns the base directory for FILE projects.
 func archiveRoot(downloadPath string) string {
 	if downloadPath == "" {
@@ -37,6 +40,10 @@ func archiveBranch(analysis codeclarity.Analysis) string {
 // Files are extracted to the same destination structure as Git clones:
 // {DOWNLOAD_PATH}/{organization_id}/projects/{project_id}/{branch}
 func Archive(analysis codeclarity.Analysis, project codeclarity.Project, organization uuid.UUID) error {
+	branch := archiveBranch(analysis)
+	if err := validateRevision(codeclarity.Analysis{}, branch); err != nil {
+		return err
+	}
 	path := archiveRoot(os.Getenv("DOWNLOAD_PATH"))
 
 	// Find the uploaded archive file
@@ -50,12 +57,10 @@ func Archive(analysis codeclarity.Analysis, project codeclarity.Project, organiz
 
 	// Destination: same structure as Git clones
 	// {DOWNLOAD_PATH}/{organization_id}/projects/{project_id}/{branch}
-	branch := archiveBranch(analysis)
-
 	destination := filepath.Join(path, organization.String(), "projects", project.Id.String(), branch)
 
 	// Create destination directory
-	if err := os.MkdirAll(destination, sharedDirMode); err != nil {
+	if err := os.MkdirAll(destination, sharedDirMode); err != nil { //nolint:gosec // G703: DOWNLOAD_PATH is operator config; the rest is UUIDs and a validated branch
 		return fmt.Errorf("failed to create destination directory: %w", err)
 	}
 
@@ -134,8 +139,9 @@ const sharedDirMode os.FileMode = 0o755
 
 // extraction writes archive entries under one root, so no entry can land outside it.
 type extraction struct {
-	root  *os.Root
-	files int
+	root    *os.Root
+	written int64
+	files   int
 }
 
 // entryPath strips the single root directory and rejects names that leave the destination.
@@ -158,7 +164,7 @@ func (x *extraction) dir(rel string) error {
 	return x.root.MkdirAll(rel, sharedDirMode)
 }
 
-// file copies r to rel.
+// file copies r to rel, failing once the whole archive passes maxExtractedBytes.
 func (x *extraction) file(rel string, mode os.FileMode, r io.Reader) error {
 	if err := x.root.MkdirAll(filepath.Dir(rel), sharedDirMode); err != nil {
 		return err
@@ -167,9 +173,13 @@ func (x *extraction) file(rel string, mode os.FileMode, r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(out, r)
+	n, copyErr := io.CopyN(out, r, maxExtractedBytes-x.written+1)
+	x.written += n
 	closeErr := out.Close()
-	if copyErr != nil {
+	if x.written > maxExtractedBytes {
+		return fmt.Errorf("archive expands to more than %d bytes", maxExtractedBytes)
+	}
+	if copyErr != nil && copyErr != io.EOF {
 		return copyErr
 	}
 	x.files++

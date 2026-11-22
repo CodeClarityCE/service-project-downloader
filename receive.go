@@ -79,7 +79,11 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 			err = Archive(analysis_info, project_info, apiMessage.OrganizationId)
 			if err != nil {
 				log.Printf("Failed to extract archive: %v", err)
-				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, "the uploaded archive could not be extracted; check that it is a valid zip or tar.gz file")
+				reason := "the uploaded archive could not be extracted; check that it is a valid zip or tar.gz file"
+				if errors.Is(err, ErrInvalidRevision) {
+					reason = downloadFailureReason(err)
+				}
+				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, reason)
 				return
 			}
 		} else {
