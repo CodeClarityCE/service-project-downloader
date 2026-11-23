@@ -42,7 +42,10 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 	if connection == "dispatcher_downloader" { // If message is from dispatcher
 		// Read message from API
 		var apiMessage types_amqp.DispatcherDownloaderMessage
-		json.Unmarshal([]byte(d.Body), &apiMessage)
+		if err := json.Unmarshal(d.Body, &apiMessage); err != nil {
+			logrus.WithError(err).Warn("Dropping a malformed dispatcher message")
+			return
+		}
 
 		// Get info. A failed analysis load is left non-terminal so the dispatcher's
 		// reaper retries it (the load itself may be a transient DB hiccup); every
@@ -76,7 +79,11 @@ func dispatch(connection string, d amqp.Delivery, service *boilerplates.ServiceB
 			err = Archive(analysis_info, project_info, apiMessage.OrganizationId)
 			if err != nil {
 				log.Printf("Failed to extract archive: %v", err)
-				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, "the uploaded archive could not be extracted; check that it is a valid zip or tar.gz file")
+				reason := "the uploaded archive could not be extracted; check that it is a valid zip or tar.gz file"
+				if errors.Is(err, ErrInvalidRevision) {
+					reason = downloadFailureReason(err)
+				}
+				markAnalysisFailed(service.DB.CodeClarity, apiMessage.AnalysisId, reason)
 				return
 			}
 		} else {
