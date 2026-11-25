@@ -79,21 +79,31 @@ func cacheFailureBackoff() time.Duration {
 	return defaultCacheFailureBackoff
 }
 
-// runGit runs a git command bounded by ctx, with interactive prompts disabled so
-// a missing/invalid credential fails fast instead of blocking on a terminal
-// prompt. On ctx timeout the process is killed so a hung fetch is reclaimed.
+// newGitCmd builds every git process the downloader starts.
+var newGitCmd = func(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, "git", args...) //nolint:gosec // G204: argv without a shell; revisions and remote URLs are vetted
+}
+
+// runGit runs a local git command; see runGitEnv.
 func runGit(ctx context.Context, dir string, args ...string) error {
-	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // G204: argv without a shell; revisions are validated and the URL is checked by the API
+	return runGitEnv(ctx, dir, nil, args...)
+}
+
+// runGitEnv runs a git command bounded by ctx with extra env (gitEnv for network
+// commands), with interactive prompts disabled so a missing/invalid credential
+// fails fast. On ctx timeout the process is killed so a hung fetch is reclaimed.
+func runGitEnv(ctx context.Context, dir string, env []string, args ...string) error {
+	cmd := newGitCmd(ctx, args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(append(os.Environ(),
 		"GIT_TERMINAL_PROMPT=0", // no interactive username/password prompt
 		"GIT_ASKPASS=true",      // no askpass helper hang
 		"GCM_INTERACTIVE=never", // git-credential-manager non-interactive
-	)
+	), env...)
 	cmd.Cancel = func() error { return cmd.Process.Kill() }
 	return cmd.Run()
 }
@@ -101,7 +111,7 @@ func runGit(ctx context.Context, dir string, args ...string) error {
 // gitOutput runs a git command bounded by ctx and returns its trimmed stdout,
 // with the same prompt hardening as runGit (stderr passes through for logs).
 func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // G204: argv without a shell; revisions are validated and the URL is checked by the API
+	cmd := newGitCmd(ctx, args...)
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -135,12 +145,12 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 		return err
 	}
 
-	// Clone git project
-	url := ""
-	if strings.Contains(project.Url, "gitlab") {
-		url = strings.ReplaceAll(project.Url, "://", "://oauth2:"+integration.AccessToken+"@")
-	} else {
-		url = strings.ReplaceAll(project.Url, "://", "://"+integration.AccessToken+"@")
+	// Vet the address before any git process; the token goes only to the integration's host.
+	policy := newRemotePolicy(integration.ServiceDomain, integration.AccessToken)
+	rem, err := policy.vet(ctx, project.Url, true)
+	if err != nil {
+		logger.WithError(err).WithField("host", hostOf(project.Url)).Warn("Refused the repository address")
+		return err
 	}
 
 	// GET download path from ENV
@@ -163,19 +173,31 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 	// reliable.
 	cacheBase := fmt.Sprintf("%s/%s/cache/%s", path, organization, project.Id)
 
+	if err := downloadTree(ctx, analysis, project, rem, cacheBase, destination, logger); err != nil {
+		return err
+	}
+	// Submodules are vetted and fetched one by one, never by a recursive clone.
+	return initSubmodules(ctx, destination, rem, policy, !hasCommit(analysis), 0, logger)
+}
+
+// downloadTree checks out the project at the analysis's branch or commit, without submodules.
+func downloadTree(ctx context.Context, analysis codeclarity.Analysis, project codeclarity.Project, rem remote, cacheBase, destination string, logger *logrus.Entry) error {
+	env := gitEnv(rem)
 	// HEAD analyses: serve from the cache (fetch the branch tip, materialize at
 	// it); otherwise a shallow single-branch clone is far faster and smaller on
 	// large repos.
 	if !hasCommit(analysis) {
-		if err := tryCacheFirst(ctx, url, cacheBase, destination, "", analysis.Branch); err == nil {
+		if err := tryCacheFirst(ctx, rem, cacheBase, destination, "", analysis.Branch); err == nil {
 			return nil
 		}
-		if err := runGit(ctx, "", "clone", "--depth", "1", "--single-branch",
-			"--recurse-submodules", "--shallow-submodules", "-b", analysis.Branch, url, destination); err != nil {
+		if err := runGitEnv(ctx, "", env, "clone", "--depth", "1", "--single-branch",
+			"-b", analysis.Branch, rem.url, destination); err != nil {
 			logger.WithError(err).Warn("Shallow clone failed, trying a pull")
 			// The destination may already exist from a previous run — try to
-			// refresh it in place rather than failing outright.
-			if err2 := runGit(ctx, destination, "pull"); err2 != nil {
+			// refresh it in place rather than failing outright. Reset origin first,
+			// so an old token-bearing remote URL is not used.
+			_ = runGit(ctx, destination, "remote", "set-url", "origin", rem.url)
+			if err2 := runGitEnv(ctx, destination, env, "pull", "--no-recurse-submodules"); err2 != nil {
 				logger.WithError(err2).Warn("Pull failed")
 				return err
 			}
@@ -192,7 +214,7 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 		return nil
 	}
 
-	if err := tryCacheFirst(ctx, url, cacheBase, destination, analysis.Commit, ""); err == nil {
+	if err := tryCacheFirst(ctx, rem, cacheBase, destination, analysis.Commit, ""); err == nil {
 		return nil
 	}
 
@@ -217,22 +239,22 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 	defer os.RemoveAll(tmp)
 
 	shallowCtx, cancelShallow := context.WithTimeout(ctx, shallowFetchTimeout)
-	shallowErr := shallowFetchCommit(shallowCtx, url, analysis.Commit, tmp)
+	shallowErr := shallowFetchCommit(shallowCtx, rem, analysis.Commit, tmp)
 	cancelShallow()
 	if shallowErr != nil {
 		log.Printf("shallow fetch of %s failed (%s); falling back to blobless clone", analysis.Commit, shallowErr)
 		_ = os.RemoveAll(tmp) //nolint:gosec // G703: DOWNLOAD_PATH is operator config; the rest is UUIDs and a validated revision
-		if err := runGit(ctx, "", "clone", "--filter=blob:none", "--no-checkout", url, tmp); err != nil {
+		if err := runGitEnv(ctx, "", env, "clone", "--filter=blob:none", "--no-checkout", rem.url, tmp); err != nil {
 			logger.WithError(err).Warn("Blobless clone failed")
 			return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
 		}
 		// Non-fatal: catches SHAs the server serves but that are not reachable from
 		// any advertised ref (e.g. force-pushed-away commits); the checkout below
 		// decides success either way.
-		if err := runGit(ctx, tmp, "fetch", "origin", analysis.Commit); err != nil {
+		if err := runGitEnv(ctx, tmp, env, "fetch", "--no-recurse-submodules", "origin", analysis.Commit); err != nil {
 			log.Printf("fetch of %s by SHA failed (%s); trying checkout from cloned refs", analysis.Commit, err)
 		}
-		if err := runGit(ctx, tmp, "checkout", "--recurse-submodules", analysis.Commit); err != nil {
+		if err := runGit(ctx, tmp, "checkout", analysis.Commit); err != nil {
 			log.Println(err.Error())
 			return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
 		}
@@ -253,8 +275,7 @@ func Git(analysis codeclarity.Analysis, project codeclarity.Project, integration
 // checkedOutAt reports whether destination already holds a work tree whose
 // HEAD is exactly the wanted commit.
 func checkedOutAt(ctx context.Context, destination, commit string) bool {
-	cmd := exec.CommandContext(ctx, "git", "-C", destination, "rev-parse", "HEAD") //nolint:gosec // G204: argv without a shell; revisions are validated and the URL is checked by the API
-	out, err := cmd.Output()
+	out, err := newGitCmd(ctx, "-C", destination, "rev-parse", "HEAD").Output()
 	return err == nil && strings.HasPrefix(strings.TrimSpace(string(out)), commit)
 }
 
@@ -262,18 +283,22 @@ func checkedOutAt(ctx context.Context, destination, commit string) bool {
 // exactly the requested commit (depth 1), then checks it out. This is far
 // cheaper than any clone for historical snapshots. Returns an error if any
 // git step fails so the caller can fall back to a blobless clone.
-func shallowFetchCommit(ctx context.Context, url, commit, destination string) error {
+func shallowFetchCommit(ctx context.Context, rem remote, commit, destination string) error {
 	if err := os.MkdirAll(destination, sharedDirMode); err != nil { //nolint:gosec // G703: DOWNLOAD_PATH is operator config; the rest is UUIDs and a validated revision
 		return err
 	}
-	steps := [][]string{
-		{"init", "-q"},
-		{"remote", "add", "origin", url},
-		{"fetch", "--depth", "1", "--recurse-submodules", "origin", commit},
-		{"checkout", "--recurse-submodules", "FETCH_HEAD"},
+	steps := []struct {
+		env  []string
+		args []string
+	}{
+		{nil, []string{"init", "-q"}},
+		{nil, []string{"remote", "add", "origin", rem.url}},
+		{gitEnv(rem), []string{"fetch", "--depth", "1", "--no-recurse-submodules", "origin", commit}},
+		{nil, []string{"checkout", "FETCH_HEAD"}},
 	}
-	for _, args := range steps {
-		if err := runGit(ctx, destination, args...); err != nil {
+	for _, step := range steps {
+		args := step.args
+		if err := runGitEnv(ctx, destination, step.env, args...); err != nil {
 			return fmt.Errorf("git %s: %w", args[0], err)
 		}
 	}
@@ -284,14 +309,14 @@ func shallowFetchCommit(ctx context.Context, url, commit, destination string) er
 // under a child deadline of half the remaining download budget, so even a slow
 // initial full-history clone can never starve the direct-clone fallback of the
 // time it needs to succeed on its own.
-func tryCacheFirst(ctx context.Context, url, cacheBase, destination, commit, branch string) error {
+func tryCacheFirst(ctx context.Context, rem remote, cacheBase, destination, commit, branch string) error {
 	if deadline, ok := ctx.Deadline(); ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Until(deadline)/2)
 		defer cancel()
 	}
 	start := time.Now()
-	if err := materializeFromCache(ctx, url, cacheBase, destination, commit, branch); err != nil {
+	if err := materializeFromCache(ctx, rem, cacheBase, destination, commit, branch); err != nil {
 		logrus.WithError(err).WithFields(logrus.Fields{
 			"cache": cacheBase + ".git", "commit": commit, "branch": branch,
 			"after": time.Since(start).Round(time.Millisecond).String(),
@@ -314,7 +339,7 @@ func tryCacheFirst(ctx context.Context, url, cacheBase, destination, commit, bra
 // the borrower makes every leaf re-fetch its blobs from the network into its
 // own objects — per-leaf transfer that defeats the cache. The full clone pays
 // one bigger initial transfer, then all ~19 materializations are network-free.
-func materializeFromCache(ctx context.Context, url, cacheBase, destination, commit, branch string) error {
+func materializeFromCache(ctx context.Context, rem remote, cacheBase, destination, commit, branch string) error {
 	gitDir := cacheBase + ".git"
 	marker := cacheBase + ".unavailable"
 
@@ -336,7 +361,7 @@ func materializeFromCache(ctx context.Context, url, cacheBase, destination, comm
 	ensureStart := time.Now()
 	created := false
 	if _, err := gitOutput(ctx, gitDir, "rev-parse", "--git-dir"); err != nil {
-		if err := createBareCache(ctx, url, gitDir); err != nil {
+		if err := createBareCache(ctx, rem, gitDir); err != nil {
 			_ = os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)+" "+err.Error()+"\n"), 0o600) //nolint:gosec // G703: DOWNLOAD_PATH is operator config; the rest is UUIDs and a validated revision
 			return fmt.Errorf("cache creation: %w", err)
 		}
@@ -350,7 +375,7 @@ func materializeFromCache(ctx context.Context, url, cacheBase, destination, comm
 		// SHA only on a miss (commit newer than the cache, or unreachable from
 		// advertised refs), pinned to a ref so it stays inspectable.
 		if runGit(ctx, gitDir, "cat-file", "-e", commit+"^{commit}") != nil {
-			if err := runGit(ctx, gitDir, "fetch", url, "+"+commit+":refs/snapshots/"+commit); err != nil {
+			if err := runGitEnv(ctx, gitDir, gitEnv(rem), "fetch", rem.url, "+"+commit+":refs/snapshots/"+commit); err != nil {
 				return fmt.Errorf("cache fetch of %s: %w", commit, err)
 			}
 			fetched = true
@@ -363,7 +388,7 @@ func materializeFromCache(ctx context.Context, url, cacheBase, destination, comm
 		// --verify --quiet: a not-yet-fetched branch yields "" without log noise
 		// (plain rev-parse echoes the ref name and complains on stderr).
 		prevTip, _ := gitOutput(ctx, gitDir, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch)
-		if err := runGit(ctx, gitDir, "fetch", url, "+refs/heads/"+branch+":refs/heads/"+branch); err != nil {
+		if err := runGitEnv(ctx, gitDir, gitEnv(rem), "fetch", rem.url, "+refs/heads/"+branch+":refs/heads/"+branch); err != nil {
 			return fmt.Errorf("cache fetch of branch %s: %w", branch, err)
 		}
 		if sha, err = gitOutput(ctx, gitDir, "rev-parse", "refs/heads/"+branch); err != nil {
@@ -408,7 +433,7 @@ func materializeFromCache(ctx context.Context, url, cacheBase, destination, comm
 	if commit == "" {
 		ref = branch
 	}
-	if err := runGit(ctx, tmp, "checkout", "--recurse-submodules", ref); err != nil {
+	if err := runGit(ctx, tmp, "checkout", ref); err != nil {
 		return fmt.Errorf("cache checkout of %s: %w", ref, err)
 	}
 	_ = os.RemoveAll(destination)                       //nolint:gosec // G703: DOWNLOAD_PATH is operator config; the rest is UUIDs and a validated revision
@@ -433,18 +458,18 @@ func materializeFromCache(ctx context.Context, url, cacheBase, destination, comm
 // promoted atomically so a crashed clone never leaves a half-written cache
 // behind. gc is disabled because shared-clone leaves borrow the cache's object
 // store: any prune could delete objects a live leaf still references. The
-// origin remote is removed so the token-bearing URL is never persisted (and a
-// rotated token can't strand the cache); every fetch passes the current URL
+// origin remote is removed so no remote URL is persisted (and a moved
+// project can't strand the cache); every fetch passes the vetted URL
 // explicitly instead. Caller must hold the project cache lock. On creation the
 // pack size is logged so the one-time transfer cost is visible next to the
 // per-analysis savings.
-func createBareCache(ctx context.Context, url, gitDir string) error {
+func createBareCache(ctx context.Context, rem remote, gitDir string) error {
 	tmp, err := os.MkdirTemp(filepath.Dir(gitDir), filepath.Base(gitDir)+".tmp-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(tmp)
-	if err := runGit(ctx, "", "clone", "--bare", url, tmp); err != nil {
+	if err := runGitEnv(ctx, "", gitEnv(rem), "clone", "--bare", rem.url, tmp); err != nil {
 		return err
 	}
 	for _, args := range [][]string{
