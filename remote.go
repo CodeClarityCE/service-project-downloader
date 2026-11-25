@@ -228,7 +228,7 @@ func resolveSubmoduleURL(super, rel string) string {
 // initSubmodules checks out the submodules of the work tree at dir one level at a time.
 // Every submodule URL is vetted with the same policy before git fetches any of them.
 func initSubmodules(ctx context.Context, dir string, super remote, p remotePolicy, shallow bool, depth int, logger *logrus.Entry) error {
-	if _, err := os.Stat(filepath.Join(dir, ".gitmodules")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, ".gitmodules")); err != nil { //nolint:gosec // G703: dir is the download path or a submodule path checked with filepath.IsLocal
 		return nil
 	}
 	out, err := gitOutput(ctx, dir, "config", "-z", "-f", ".gitmodules", "--get-regexp", `^submodule\..*\.url$`)

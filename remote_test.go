@@ -7,7 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"net/http/cgi"
+	"net/http/cgi" //nolint:gosec // G504: test server for git http-backend; Go is far past 1.6.3
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
@@ -222,7 +222,7 @@ func newGitServer(t *testing.T, redirects map[string]string) *gitServer {
 		}
 		for from, to := range redirects {
 			if strings.HasPrefix(r.URL.Path, from) {
-				http.Redirect(w, r, to+strings.TrimPrefix(r.URL.Path, from)+"?"+r.URL.RawQuery, http.StatusFound)
+				http.Redirect(w, r, to+strings.TrimPrefix(r.URL.Path, from)+"?"+r.URL.RawQuery, http.StatusFound) //nolint:gosec // G710: test server redirecting on purpose
 				return
 			}
 		}
@@ -242,7 +242,7 @@ func (s *gitServer) port(t *testing.T) string {
 // run runs git in dir for test setup.
 func run(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := exec.Command("git", args...) //nolint:gosec // G204: fixed test setup commands
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
 	out, err := cmd.CombinedOutput()
@@ -328,7 +328,7 @@ func TestCloneFromAllowedPrivateHostSendsTheTokenOnlyAsAHeader(t *testing.T) {
 	for _, dir := range []string{dest, filepath.Join(download, org.String(), "cache")} {
 		_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
 			if err == nil && !info.IsDir() && filepath.Base(p) == "config" {
-				if b, _ := os.ReadFile(p); bytes.Contains(b, []byte(testToken)) {
+				if b, _ := os.ReadFile(p); bytes.Contains(b, []byte(testToken)) { //nolint:gosec // G304: a file under the test's temp dir
 					t.Errorf("token in %s", p)
 				}
 			}
@@ -382,7 +382,7 @@ func TestCommitCloneWithoutTheCacheSendsTheTokenOnEveryFetch(t *testing.T) {
 	if !blobless {
 		t.Fatalf("want the blobless tier to run, got %v", rec.all())
 	}
-	if b, _ := os.ReadFile(filepath.Join(dest, ".git", "config")); bytes.Contains(b, []byte(testToken)) {
+	if b, _ := os.ReadFile(filepath.Join(dest, ".git", "config")); bytes.Contains(b, []byte(testToken)) { //nolint:gosec // G304: a file under the test's temp dir
 		t.Error("token in the cloned repo's config")
 	}
 	for _, args := range rec.all() {
