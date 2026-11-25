@@ -254,7 +254,8 @@ func downloadTree(ctx context.Context, analysis codeclarity.Analysis, project co
 		if err := runGitEnv(ctx, tmp, env, "fetch", "--no-recurse-submodules", "origin", analysis.Commit); err != nil {
 			log.Printf("fetch of %s by SHA failed (%s); trying checkout from cloned refs", analysis.Commit, err)
 		}
-		if err := runGit(ctx, tmp, "checkout", analysis.Commit); err != nil {
+		// The blobless checkout fetches file contents, so it needs the network env.
+		if err := runGitEnv(ctx, tmp, env, "checkout", analysis.Commit); err != nil {
 			log.Println(err.Error())
 			return fmt.Errorf("%w: commit %s in %s: %v", ErrCommitUnresolvable, analysis.Commit, project.Url, err)
 		}
@@ -297,9 +298,8 @@ func shallowFetchCommit(ctx context.Context, rem remote, commit, destination str
 		{nil, []string{"checkout", "FETCH_HEAD"}},
 	}
 	for _, step := range steps {
-		args := step.args
-		if err := runGitEnv(ctx, destination, step.env, args...); err != nil {
-			return fmt.Errorf("git %s: %w", args[0], err)
+		if err := runGitEnv(ctx, destination, step.env, step.args...); err != nil {
+			return fmt.Errorf("git %s: %w", step.args[0], err)
 		}
 	}
 	return nil

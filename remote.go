@@ -65,8 +65,8 @@ type remotePolicy struct {
 type remote struct {
 	url  string
 	host string
-	pins []string // http.curloptResolve entries
-	auth []string // URL-scoped extraHeader entries, key then value
+	pins []string   // http.curloptResolve entries
+	auth *[2]string // URL-scoped extraHeader key and value, when the token is sent
 }
 
 // hostOf returns the lower-case host name of a URL or bare host, without brackets.
@@ -104,6 +104,9 @@ func (p remotePolicy) vet(ctx context.Context, raw string, isProject bool) (remo
 		return remote{}, fmt.Errorf("%w: only https URLs without credentials are allowed", ErrRemoteNotAllowed)
 	}
 	host := strings.ToLower(u.Hostname())
+	if numericHost(host) {
+		return remote{}, fmt.Errorf("%w: host %s is a numeric address in a form git and Go read differently", ErrRemoteNotAllowed, host)
+	}
 	onIntegrationHost := p.host != "" && host == p.host
 	if isProject && !onIntegrationHost {
 		return remote{}, fmt.Errorf("%w: host %s is not the integration's host", ErrRemoteNotAllowed, host)
@@ -145,9 +148,23 @@ func (p remotePolicy) vet(ctx context.Context, raw string, isProject bool) (remo
 	}
 	if onIntegrationHost && p.token != "" {
 		// Scoped to this scheme, host and port, so no other host ever gets the header.
-		r.auth = []string{"http." + u.Scheme + "://" + u.Host + "/.extraHeader", authHeader(host, p.token)}
+		r.auth = &[2]string{"http." + u.Scheme + "://" + u.Host + "/.extraHeader", authHeader(host, p.token)}
 	}
 	return r, nil
+}
+
+// numericHost reports a host that is not a plain IP literal but that curl would read as an
+// address, such as 2130706433, 127.1 or 0x7f.1; a real host name never ends in a numeric label.
+func numericHost(host string) bool {
+	if _, err := netip.ParseAddr(host); err == nil {
+		return false
+	}
+	labels := strings.Split(strings.TrimSuffix(host, "."), ".")
+	last := labels[len(labels)-1]
+	if strings.HasPrefix(last, "0x") {
+		return true
+	}
+	return strings.Trim(last, "0123456789") == ""
 }
 
 // authHeader is the basic-auth header GitHub (token as user) or GitLab (oauth2 user) expects.
@@ -161,18 +178,16 @@ func authHeader(host, token string) string {
 
 // gitEnv is the environment for network git commands fetching from the given remotes:
 // https only, no redirects, no stored credentials, vetted addresses pinned, token only by header.
-func gitEnv(remotes ...remote) []string {
+func gitEnv(r remote) []string {
 	config := [][2]string{
 		{"http.followRedirects", "false"},
 		{"credential.helper", ""},
 	}
-	for _, r := range remotes {
-		for _, pin := range r.pins {
-			config = append(config, [2]string{"http.curloptResolve", pin})
-		}
-		if len(r.auth) == 2 {
-			config = append(config, [2]string{r.auth[0], r.auth[1]})
-		}
+	for _, pin := range r.pins {
+		config = append(config, [2]string{"http.curloptResolve", pin})
+	}
+	if r.auth != nil {
+		config = append(config, *r.auth)
 	}
 	env := []string{"GIT_ALLOW_PROTOCOL=https", "GIT_CONFIG_COUNT=" + strconv.Itoa(len(config))}
 	for i, kv := range config {
@@ -182,62 +197,84 @@ func gitEnv(remotes ...remote) []string {
 }
 
 // resolveSubmoduleURL resolves a relative submodule URL against its superproject's URL, as git does.
+// It returns "" when the relative URL climbs past the superproject's host.
 func resolveSubmoduleURL(super, rel string) string {
 	if !strings.HasPrefix(rel, "./") && !strings.HasPrefix(rel, "../") {
 		return rel
 	}
-	base := strings.TrimSuffix(super, "/")
+	u, err := url.Parse(super)
+	if err != nil {
+		return ""
+	}
+	base := strings.TrimSuffix(u.Path, "/")
 	for {
 		switch {
 		case strings.HasPrefix(rel, "./"):
 			rel = rel[2:]
 		case strings.HasPrefix(rel, "../"):
-			if i := strings.LastIndex(base, "/"); i >= 0 {
-				base = base[:i]
+			i := strings.LastIndex(base, "/")
+			if i < 0 {
+				return ""
 			}
+			base = base[:i]
 			rel = rel[3:]
 		default:
-			return base + "/" + rel
+			u.Path = base + "/" + rel
+			return u.String()
 		}
 	}
 }
 
-// initSubmodules checks out the submodules of the work tree at dir one level at a time,
-// vetting each submodule URL with the same policy before git fetches it.
-func initSubmodules(ctx context.Context, dir string, super remote, p remotePolicy, shallow bool, depth int, log *logrus.Entry) error {
+// initSubmodules checks out the submodules of the work tree at dir one level at a time.
+// Every submodule URL is vetted with the same policy before git fetches any of them.
+func initSubmodules(ctx context.Context, dir string, super remote, p remotePolicy, shallow bool, depth int, logger *logrus.Entry) error {
 	if _, err := os.Stat(filepath.Join(dir, ".gitmodules")); err != nil {
 		return nil
 	}
-	out, err := gitOutput(ctx, dir, "config", "-f", ".gitmodules", "--get-regexp", `^submodule\..*\.url$`)
+	out, err := gitOutput(ctx, dir, "config", "-z", "-f", ".gitmodules", "--get-regexp", `^submodule\..*\.url$`)
 	if err != nil || out == "" {
 		return nil
 	}
 	if depth >= maxSubmoduleDepth {
 		return fmt.Errorf("%w: submodules nested deeper than %d", ErrRemoteNotAllowed, maxSubmoduleDepth)
 	}
-	for line := range strings.SplitSeq(out, "\n") {
-		key, rawURL, _ := strings.Cut(line, " ")
+
+	type submodule struct {
+		name, path string
+		remote     remote
+	}
+	var subs []submodule
+	paths := map[string]bool{}
+	// With -z each entry is "key\nvalue" and entries end in NUL.
+	for entry := range strings.SplitSeq(strings.TrimSuffix(out, "\x00"), "\x00") {
+		key, rawURL, _ := strings.Cut(entry, "\n")
 		name := strings.TrimSuffix(strings.TrimPrefix(key, "submodule."), ".url")
 		path, err := gitOutput(ctx, dir, "config", "-f", ".gitmodules", "--get", "submodule."+name+".path")
-		if err != nil || !filepath.IsLocal(path) {
-			return fmt.Errorf("%w: submodule %q has no safe path", ErrRemoteNotAllowed, name)
+		if err != nil || !filepath.IsLocal(path) || paths[filepath.Clean(path)] {
+			return fmt.Errorf("%w: submodule %q has no safe, unique path", ErrRemoteNotAllowed, name)
 		}
-		sub, err := p.vet(ctx, resolveSubmoduleURL(super.url, rawURL), false)
+		paths[filepath.Clean(path)] = true
+		resolved := resolveSubmoduleURL(super.url, rawURL)
+		sub, err := p.vet(ctx, resolved, false)
 		if err != nil {
-			log.WithError(err).WithFields(logrus.Fields{"submodule": name, "host": hostOf(resolveSubmoduleURL(super.url, rawURL))}).Warn("Refused a submodule address")
+			logger.WithError(err).WithFields(logrus.Fields{"submodule": name, "host": hostOf(resolved)}).Warn("Refused a submodule address")
 			return err
 		}
-		if err := runGit(ctx, dir, "config", "submodule."+name+".url", sub.url); err != nil {
+		subs = append(subs, submodule{name, path, sub})
+	}
+
+	for _, sub := range subs {
+		if err := runGit(ctx, dir, "config", "submodule."+sub.name+".url", sub.remote.url); err != nil {
 			return fmt.Errorf("git config submodule: %w", err)
 		}
 		args := []string{"submodule", "update", "--init"}
 		if shallow {
 			args = append(args, "--depth", "1")
 		}
-		if err := runGitEnv(ctx, dir, gitEnv(sub), append(args, "--", path)...); err != nil {
-			return fmt.Errorf("git submodule update %s: %w", name, err)
+		if err := runGitEnv(ctx, dir, gitEnv(sub.remote), append(args, "--", sub.path)...); err != nil {
+			return fmt.Errorf("git submodule update %s: %w", sub.name, err)
 		}
-		if err := initSubmodules(ctx, filepath.Join(dir, path), sub, p, shallow, depth+1, log); err != nil {
+		if err := initSubmodules(ctx, filepath.Join(dir, sub.path), sub.remote, p, shallow, depth+1, logger); err != nil {
 			return err
 		}
 	}

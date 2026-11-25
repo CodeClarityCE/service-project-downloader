@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -40,13 +41,19 @@ func (r *gitRecorder) all() [][]string {
 // recordGit wraps newGitCmd so the test sees every git command line; run=false fails them all.
 func recordGit(t *testing.T, run bool) *gitRecorder {
 	t.Helper()
+	return recordGitFailing(t, func([]string) bool { return !run })
+}
+
+// recordGitFailing records every git command line and fails the ones fail picks.
+func recordGitFailing(t *testing.T, fail func(args []string) bool) *gitRecorder {
+	t.Helper()
 	rec := &gitRecorder{}
 	saved := newGitCmd
 	newGitCmd = func(ctx context.Context, args ...string) *exec.Cmd {
 		rec.mu.Lock()
 		rec.calls = append(rec.calls, args)
 		rec.mu.Unlock()
-		if !run {
+		if fail(args) {
 			return exec.CommandContext(ctx, "false")
 		}
 		return saved(ctx, args...)
@@ -181,6 +188,8 @@ type gitServer struct {
 	root string
 	mu   sync.Mutex
 	seen []string
+	// requireAuth, when set, answers 401 to any request without this Authorization header.
+	requireAuth string
 }
 
 func (s *gitServer) requests() []string {
@@ -204,7 +213,13 @@ func newGitServer(t *testing.T, redirects map[string]string) *gitServer {
 	s.Server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.seen = append(s.seen, r.URL.Path+" auth="+r.Header.Get("Authorization"))
+		required := s.requireAuth
 		s.mu.Unlock()
+		if required != "" && r.Header.Get("Authorization") != required {
+			w.Header().Set("WWW-Authenticate", `Basic realm="git"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		for from, to := range redirects {
 			if strings.HasPrefix(r.URL.Path, from) {
 				http.Redirect(w, r, to+strings.TrimPrefix(r.URL.Path, from)+"?"+r.URL.RawQuery, http.StatusFound)
@@ -258,7 +273,9 @@ func (s *gitServer) addRepo(t *testing.T, name string, files map[string]string, 
 		run(t, work, "update-index", "--add", "--cacheinfo", "160000,"+subCommit+",sub")
 	}
 	run(t, work, "commit", "-q", "-m", "init")
-	run(t, "", "clone", "-q", "--bare", work, filepath.Join(s.root, name+".git"))
+	bare := filepath.Join(s.root, name+".git")
+	run(t, "", "clone", "-q", "--bare", work, bare)
+	run(t, bare, "config", "uploadpack.allowFilter", "true")
 	return run(t, work, "rev-parse", "HEAD")
 }
 
@@ -320,6 +337,74 @@ func TestCloneFromAllowedPrivateHostSendsTheTokenOnlyAsAHeader(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), testToken) {
 		t.Errorf("token in logs")
+	}
+}
+
+func TestCommitCloneWithoutTheCacheSendsTheTokenOnEveryFetch(t *testing.T) {
+	download := t.TempDir()
+	t.Setenv("DOWNLOAD_PATH", download)
+	srv := newGitServer(t, nil)
+	commit := srv.addRepo(t, "repo", map[string]string{"package.json": "{}"}, "", "")
+	srv.requireAuth = basicAuth("oauth2", testToken)
+	trustServers(t)
+	fakeDNS(t, map[string]string{"gitlab.internal": "127.0.0.1"})
+	t.Setenv(allowedPrivateHostsEnv, "gitlab.internal")
+	// The shallow fetch by SHA fails, so the blobless clone and its checkout run.
+	rec := recordGitFailing(t, func(args []string) bool {
+		return len(args) > 1 && args[0] == "fetch" && args[1] == "--depth"
+	})
+
+	host := "gitlab.internal:" + srv.port(t)
+	org := uuid.New()
+	project := vcsProject("https://" + host + "/repo.git")
+	// A recent cache failure sends the download to the shallow and blobless tiers.
+	cache := filepath.Join(download, org.String(), "cache", project.Id.String())
+	if err := os.MkdirAll(filepath.Dir(cache), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache+".unavailable", []byte("test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	analysis := codeclarity.Analysis{Id: uuid.New(), Branch: "main", Commit: commit}
+
+	if err := Git(analysis, project, gitlabIntegration("https://"+host), org); err != nil {
+		t.Fatalf("clone at commit: %v", err)
+	}
+
+	dest := projectSourcePath(download, org, project, analysis)
+	if _, err := os.Stat(filepath.Join(dest, "package.json")); err != nil {
+		t.Fatalf("want the commit checked out: %v", err)
+	}
+	blobless := false
+	for _, args := range rec.all() {
+		blobless = blobless || slices.Contains(args, "--filter=blob:none")
+	}
+	if !blobless {
+		t.Fatalf("want the blobless tier to run, got %v", rec.all())
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest, ".git", "config")); bytes.Contains(b, []byte(testToken)) {
+		t.Error("token in the cloned repo's config")
+	}
+	for _, args := range rec.all() {
+		if strings.Contains(strings.Join(args, " "), testToken) {
+			t.Errorf("token on a git command line: %v", args)
+		}
+	}
+}
+
+func TestNumericHostFormsAreRefused(t *testing.T) {
+	t.Setenv("DOWNLOAD_PATH", t.TempDir())
+	rec := recordGit(t, false)
+	fakeDNS(t, map[string]string{"2130706433": "203.0.113.1", "0x7f.1": "203.0.113.1", "127.1": "203.0.113.1"})
+
+	for _, host := range []string{"2130706433", "0x7f.1", "127.1"} {
+		err := Git(headAnalysis(), vcsProject("https://"+host+"/repo"), gitlabIntegration("https://"+host), uuid.New())
+		if !errors.Is(err, ErrRemoteNotAllowed) {
+			t.Errorf("%s: want ErrRemoteNotAllowed, got %v", host, err)
+		}
+	}
+	if calls := rec.all(); len(calls) != 0 {
+		t.Errorf("want no git process, got %v", calls)
 	}
 }
 
@@ -412,6 +497,8 @@ func TestRelativeSubmoduleURLResolvesAgainstTheProject(t *testing.T) {
 		{"https://h/g/p", "./lib", "https://h/g/p/lib"},
 		{"https://h/g/sub/p.git", "../../x/lib.git", "https://h/g/x/lib.git"},
 		{"https://h/g/p.git", "https://other/lib.git", "https://other/lib.git"},
+		// Climbing past the host would change it, so it resolves to nothing.
+		{"https://h/g/p.git", "../../../evil/x.git", ""},
 	} {
 		if got := resolveSubmoduleURL(tc.super, tc.rel); got != tc.want {
 			t.Errorf("%s + %s = %s, want %s", tc.super, tc.rel, got, tc.want)
@@ -423,5 +510,30 @@ func TestFailureReasonForARefusedAddress(t *testing.T) {
 	got := downloadFailureReason(errors.Join(ErrRemoteNotAllowed, errors.New("host x")))
 	if !strings.Contains(got, "not allowed") {
 		t.Errorf("got %q", got)
+	}
+}
+
+func TestTwoSubmodulesWithOnePathAreRefusedBeforeAnyFetch(t *testing.T) {
+	dir := t.TempDir()
+	run(t, dir, "init", "-q")
+	gitmodules := "[submodule \"a\"]\n\tpath = lib\n\turl = https://gitlab.test/a.git\n" +
+		"[submodule \"b\"]\n\tpath = ./lib\n\turl = https://other.test/b.git\n"
+	if err := os.WriteFile(filepath.Join(dir, ".gitmodules"), []byte(gitmodules), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	treatAllAddressesAsPublic(t)
+	fakeDNS(t, map[string]string{"gitlab.test": "127.0.0.1", "other.test": "127.0.0.1"})
+	rec := recordGit(t, true)
+	p := newRemotePolicy("https://gitlab.test", testToken)
+
+	err := initSubmodules(context.Background(), dir, remote{url: "https://gitlab.test/repo.git"}, p, true, 0, logrus.NewEntry(logrus.StandardLogger()))
+
+	if !errors.Is(err, ErrRemoteNotAllowed) {
+		t.Fatalf("want ErrRemoteNotAllowed, got %v", err)
+	}
+	for _, args := range rec.all() {
+		if slices.Contains(args, "submodule") {
+			t.Errorf("want no submodule fetch, got %v", args)
+		}
 	}
 }
