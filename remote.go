@@ -63,10 +63,11 @@ type remotePolicy struct {
 
 // remote is a vetted address: what git may fetch, and the git environment that enforces it.
 type remote struct {
-	url  string
-	host string
-	pins []string   // http.curloptResolve entries
-	auth *[2]string // URL-scoped extraHeader key and value, when the token is sent
+	url    string
+	host   string
+	scheme string     // https, or http for an allowlisted integration host
+	pins   []string   // http.curloptResolve entries
+	auth   *[2]string // URL-scoped extraHeader key and value, when the token is sent
 }
 
 // hostOf returns the lower-case host name of a URL or bare host, without brackets.
@@ -96,12 +97,12 @@ func newRemotePolicy(serviceDomain, token string) remotePolicy {
 	return remotePolicy{host: hostOf(serviceDomain), token: token, allowedPrivate: allowed}
 }
 
-// vet checks one address: https only, no credentials in the URL, the project on the
-// integration's host, and no internal address unless the operator allows the integration's host.
+// vet checks one address: https only, no credentials in the URL, the project on the integration's host.
+// An integration host the operator allowlists may use plain http and internal addresses, as in the API.
 func (p remotePolicy) vet(ctx context.Context, raw string, isProject bool) (remote, error) {
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.User != nil || u.Hostname() == "" || u.Opaque != "" {
-		return remote{}, fmt.Errorf("%w: only https URLs without credentials are allowed", ErrRemoteNotAllowed)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.Hostname() == "" || u.Opaque != "" {
+		return remote{}, fmt.Errorf("%w: only http(s) URLs without credentials are allowed", ErrRemoteNotAllowed)
 	}
 	host := strings.ToLower(u.Hostname())
 	if numericHost(host) {
@@ -111,9 +112,13 @@ func (p remotePolicy) vet(ctx context.Context, raw string, isProject bool) (remo
 	if isProject && !onIntegrationHost {
 		return remote{}, fmt.Errorf("%w: host %s is not the integration's host", ErrRemoteNotAllowed, host)
 	}
+	privateAllowed := onIntegrationHost && p.allowedPrivate[host]
+	if u.Scheme == "http" && !privateAllowed {
+		return remote{}, fmt.Errorf("%w: plain http is allowed only for an allowlisted integration host", ErrRemoteNotAllowed)
+	}
 	port := u.Port()
 	if port == "" {
-		port = "443"
+		port = map[string]string{"https": "443", "http": "80"}[u.Scheme]
 	}
 	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
 		return remote{}, fmt.Errorf("%w: bad port %q", ErrRemoteNotAllowed, port)
@@ -128,7 +133,6 @@ func (p remotePolicy) vet(ctx context.Context, raw string, isProject bool) (remo
 	if len(addrs) == 0 {
 		return remote{}, fmt.Errorf("%w: host %s has no address", ErrRemoteNotAllowed, host)
 	}
-	privateAllowed := onIntegrationHost && p.allowedPrivate[host]
 	pinned := make([]string, 0, len(addrs))
 	for _, a := range addrs {
 		if isInternalAddress(a) && !privateAllowed {
@@ -142,7 +146,7 @@ func (p remotePolicy) vet(ctx context.Context, raw string, isProject bool) (remo
 	}
 
 	// curl wants the name without brackets; IPv6 literals need no pin.
-	r := remote{url: u.String(), host: host}
+	r := remote{url: u.String(), host: host, scheme: u.Scheme}
 	if _, err := netip.ParseAddr(host); err != nil {
 		r.pins = []string{host + ":" + port + ":" + strings.Join(pinned, ",")}
 	}
@@ -176,8 +180,8 @@ func authHeader(host, token string) string {
 	return "Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte(creds))
 }
 
-// gitEnv is the environment for network git commands fetching from the given remotes:
-// https only, no redirects, no stored credentials, vetted addresses pinned, token only by header.
+// gitEnv is the environment for network git commands fetching from the given remote:
+// its vetted scheme only, no redirects, no stored credentials, addresses pinned, token only by header.
 func gitEnv(r remote) []string {
 	config := [][2]string{
 		{"http.followRedirects", "false"},
@@ -189,7 +193,11 @@ func gitEnv(r remote) []string {
 	if r.auth != nil {
 		config = append(config, *r.auth)
 	}
-	env := []string{"GIT_ALLOW_PROTOCOL=https", "GIT_CONFIG_COUNT=" + strconv.Itoa(len(config))}
+	protocols := "https"
+	if r.scheme == "http" {
+		protocols = "https:http"
+	}
+	env := []string{"GIT_ALLOW_PROTOCOL=" + protocols, "GIT_CONFIG_COUNT=" + strconv.Itoa(len(config))}
 	for i, kv := range config {
 		env = append(env, fmt.Sprintf("GIT_CONFIG_KEY_%d=%s", i, kv[0]), fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", i, kv[1]))
 	}
