@@ -119,10 +119,11 @@ func TestProjectOnAnotherHostStartsNoGitAndUsesNoToken(t *testing.T) {
 	}
 }
 
-func TestOnlyHTTPSURLsAreAccepted(t *testing.T) {
+func TestOnlyHTTPSURLsAreAcceptedForAHostNotAllowlisted(t *testing.T) {
 	t.Setenv("DOWNLOAD_PATH", t.TempDir())
 	rec := recordGit(t, false)
 	fakeDNS(t, map[string]string{"gitlab.example.com": "203.0.113.10"})
+	t.Setenv(allowedPrivateHostsEnv, "other.example.com")
 
 	for _, u := range []string{
 		"http://gitlab.example.com/group/repo",
@@ -139,6 +140,51 @@ func TestOnlyHTTPSURLsAreAccepted(t *testing.T) {
 	}
 	if calls := rec.all(); len(calls) != 0 {
 		t.Errorf("want no git process, got %v", calls)
+	}
+}
+
+func TestHTTPIsRefusedUnlessTheIntegrationHostIsAllowlisted(t *testing.T) {
+	t.Setenv("DOWNLOAD_PATH", t.TempDir())
+	rec := recordGit(t, false)
+	fakeDNS(t, map[string]string{"gitlab.example.com": "203.0.113.10", "gitlab.internal": "10.0.0.5"})
+
+	cases := []struct{ project, domain, allow string }{
+		{"http://gitlab.example.com/group/repo", "http://gitlab.example.com", ""},
+		{"http://gitlab.example.com/group/repo", "https://gitlab.example.com", "gitlab.internal"},
+		{"http://gitlab.internal/group/repo", "http://gitlab.internal", "other.internal"},
+		// An allowlisted host that is not the integration's host gets nothing either.
+		{"http://gitlab.internal/group/repo", "http://gitlab.example.com", "gitlab.internal"},
+	}
+	for _, tc := range cases {
+		t.Setenv(allowedPrivateHostsEnv, tc.allow)
+		err := Git(headAnalysis(), vcsProject(tc.project), gitlabIntegration(tc.domain), uuid.New())
+		if !errors.Is(err, ErrRemoteNotAllowed) {
+			t.Errorf("%s on %s (allow %q): want ErrRemoteNotAllowed, got %v", tc.project, tc.domain, tc.allow, err)
+		}
+	}
+	if calls := rec.all(); len(calls) != 0 {
+		t.Errorf("want no git process, got %v", calls)
+	}
+}
+
+func TestAnHTTPRemoteGetsHTTPPortAndHeaderInItsOwnEnv(t *testing.T) {
+	fakeDNS(t, map[string]string{"gitlab.internal": "10.0.0.5"})
+	t.Setenv(allowedPrivateHostsEnv, "gitlab.internal")
+	p := newRemotePolicy("gitlab.internal", testToken)
+	for raw, want := range map[string][3]string{
+		"https://gitlab.internal/g/r.git": {"https", "gitlab.internal:443:10.0.0.5", "http.https://gitlab.internal/.extraHeader"},
+		"http://gitlab.internal/g/r.git":  {"https:http", "gitlab.internal:80:10.0.0.5", "http.http://gitlab.internal/.extraHeader"},
+	} {
+		r, err := p.vet(context.Background(), raw, true)
+		if err != nil {
+			t.Fatalf("%s: %v", raw, err)
+		}
+		env := gitEnv(r)
+		for _, kv := range []string{"GIT_ALLOW_PROTOCOL=" + want[0], "GIT_CONFIG_VALUE_2=" + want[1], "GIT_CONFIG_KEY_3=" + want[2]} {
+			if !slices.Contains(env, kv) {
+				t.Errorf("%s: want %s, got %v", raw, kv, env)
+			}
+		}
 	}
 }
 
@@ -192,6 +238,13 @@ type gitServer struct {
 	requireAuth string
 }
 
+// setRequireAuth sets requireAuth under the lock the handler reads it with.
+func (s *gitServer) setRequireAuth(header string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requireAuth = header
+}
+
 func (s *gitServer) requests() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -199,6 +252,17 @@ func (s *gitServer) requests() []string {
 }
 
 func newGitServer(t *testing.T, redirects map[string]string) *gitServer {
+	t.Helper()
+	return startGitServer(t, redirects, httptest.NewTLSServer)
+}
+
+// newHTTPGitServer is newGitServer over plain http.
+func newHTTPGitServer(t *testing.T) *gitServer {
+	t.Helper()
+	return startGitServer(t, nil, httptest.NewServer)
+}
+
+func startGitServer(t *testing.T, redirects map[string]string, start func(http.Handler) *httptest.Server) *gitServer {
 	t.Helper()
 	backend, err := exec.Command("git", "--exec-path").Output()
 	if err != nil {
@@ -210,7 +274,7 @@ func newGitServer(t *testing.T, redirects map[string]string) *gitServer {
 	}
 	s := &gitServer{root: t.TempDir()}
 	cgiHandler := &cgi.Handler{Path: backendPath, Env: []string{"GIT_PROJECT_ROOT=" + s.root, "GIT_HTTP_EXPORT_ALL=1"}}
-	s.Server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	s.Server = start(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.seen = append(s.seen, r.URL.Path+" auth="+r.Header.Get("Authorization"))
 		required := s.requireAuth
@@ -340,12 +404,55 @@ func TestCloneFromAllowedPrivateHostSendsTheTokenOnlyAsAHeader(t *testing.T) {
 	}
 }
 
+func TestHTTPCloneFromAllowedPrivateHostSendsTheTokenOnlyAsAHeader(t *testing.T) {
+	download := t.TempDir()
+	t.Setenv("DOWNLOAD_PATH", download)
+	srv := newHTTPGitServer(t)
+	srv.addRepo(t, "repo", map[string]string{"package.json": "{}"}, "", "")
+	srv.setRequireAuth(basicAuth("oauth2", testToken))
+	fakeDNS(t, map[string]string{"gitlab.internal": "127.0.0.1"})
+	t.Setenv(allowedPrivateHostsEnv, "gitlab.internal")
+	rec := recordGit(t, true)
+	logs := captureLogs(t)
+
+	host := "gitlab.internal:" + srv.port(t)
+	org := uuid.New()
+	project := vcsProject("http://" + host + "/repo.git")
+	analysis := headAnalysis()
+	if err := Git(analysis, project, gitlabIntegration("http://"+host), org); err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+
+	dest := projectSourcePath(download, org, project, analysis)
+	if _, err := os.Stat(filepath.Join(dest, "package.json")); err != nil {
+		t.Fatalf("want the repository checked out at %s: %v", dest, err)
+	}
+	for _, args := range rec.all() {
+		if strings.Contains(strings.Join(args, " "), testToken) {
+			t.Errorf("token on a git command line: %v", args)
+		}
+	}
+	for _, dir := range []string{dest, filepath.Join(download, org.String(), "cache")} {
+		_ = filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+			if err == nil && !info.IsDir() && filepath.Base(p) == "config" {
+				if b, _ := os.ReadFile(p); bytes.Contains(b, []byte(testToken)) { //nolint:gosec // G304: a file under the test's temp dir
+					t.Errorf("token in %s", p)
+				}
+			}
+			return nil
+		})
+	}
+	if strings.Contains(logs.String(), testToken) {
+		t.Errorf("token in logs")
+	}
+}
+
 func TestCommitCloneWithoutTheCacheSendsTheTokenOnEveryFetch(t *testing.T) {
 	download := t.TempDir()
 	t.Setenv("DOWNLOAD_PATH", download)
 	srv := newGitServer(t, nil)
 	commit := srv.addRepo(t, "repo", map[string]string{"package.json": "{}"}, "", "")
-	srv.requireAuth = basicAuth("oauth2", testToken)
+	srv.setRequireAuth(basicAuth("oauth2", testToken))
 	trustServers(t)
 	fakeDNS(t, map[string]string{"gitlab.internal": "127.0.0.1"})
 	t.Setenv(allowedPrivateHostsEnv, "gitlab.internal")
@@ -488,6 +595,62 @@ func TestSubmoduleOnAnInternalHostIsRefused(t *testing.T) {
 	}
 	if r := other.requests(); len(r) != 0 {
 		t.Errorf("want no request to the internal submodule host, got %v", r)
+	}
+}
+
+func TestHTTPSubmoduleOnAnAllowlistedIntegrationHostIsCloned(t *testing.T) {
+	download := t.TempDir()
+	t.Setenv("DOWNLOAD_PATH", download)
+	srv := newHTTPGitServer(t)
+	subCommit := srv.addRepo(t, "lib", map[string]string{"lib.txt": "lib"}, "", "")
+	srv.addRepo(t, "repo", map[string]string{"a": "a"}, "../lib.git", subCommit)
+	srv.setRequireAuth(basicAuth("oauth2", testToken))
+	fakeDNS(t, map[string]string{"gitlab.internal": "127.0.0.1"})
+	t.Setenv(allowedPrivateHostsEnv, "gitlab.internal")
+	host := "gitlab.internal:" + srv.port(t)
+
+	org := uuid.New()
+	project := vcsProject("http://" + host + "/repo.git")
+	analysis := headAnalysis()
+	if err := Git(analysis, project, gitlabIntegration("http://"+host), org); err != nil {
+		t.Fatalf("clone: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(projectSourcePath(download, org, project, analysis), "sub", "lib.txt")); err != nil {
+		t.Errorf("want the submodule checked out: %v", err)
+	}
+}
+
+func TestHTTPSubmoduleIsRefusedOffAnAllowlistedIntegrationHost(t *testing.T) {
+	main := newGitServer(t, nil)
+	other := newHTTPGitServer(t)
+	subCommit := other.addRepo(t, "lib", map[string]string{"lib.txt": "lib"}, "", "")
+	trustServers(t)
+	treatAllAddressesAsPublic(t)
+	fakeDNS(t, map[string]string{"gitlab.test": "127.0.0.1", "other.test": "127.0.0.1"})
+	host := "gitlab.test:" + main.port(t)
+
+	for _, tc := range []struct{ name, subHost, allow string }{
+		// A foreign host, even one on the allowlist.
+		{"foreign", "other.test", "other.test,gitlab.test"},
+		// The integration's host, not on the allowlist.
+		{"not allowlisted", "gitlab.test", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DOWNLOAD_PATH", t.TempDir())
+			t.Setenv(allowedPrivateHostsEnv, tc.allow)
+			repo := strings.ReplaceAll(tc.name, " ", "-")
+			main.addRepo(t, repo, map[string]string{"a": "a"}, "http://"+tc.subHost+":"+other.port(t)+"/lib.git", subCommit)
+
+			err := Git(headAnalysis(), vcsProject("https://"+host+"/"+repo+".git"), gitlabIntegration("https://"+host), uuid.New())
+
+			if !errors.Is(err, ErrRemoteNotAllowed) {
+				t.Fatalf("want ErrRemoteNotAllowed, got %v", err)
+			}
+			if r := other.requests(); len(r) != 0 {
+				t.Errorf("want no request to the http submodule host, got %v", r)
+			}
+		})
 	}
 }
 
