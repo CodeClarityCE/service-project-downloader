@@ -63,6 +63,8 @@ func downloadFailureReason(err error) string {
 	switch {
 	case errors.Is(err, ErrCommitUnresolvable):
 		return "the requested commit could not be found in the repository"
+	case errors.Is(err, ErrRemoteNotAllowed):
+		return "the repository address is not allowed: it must be an https URL on the integration's host (plain http only for a host in GITLAB_ALLOWED_PRIVATE_HOSTS), and its host and submodules must not resolve to an internal address"
 	case errors.Is(err, ErrInvalidRevision):
 		return "the requested branch or commit is not a valid name"
 	case errors.Is(err, context.DeadlineExceeded):

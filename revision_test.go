@@ -60,9 +60,16 @@ func TestGitRejectsOptionShapedOrEscapingRevisions(t *testing.T) {
 func TestGitClonesBranchWithSlash(t *testing.T) {
 	base := t.TempDir()
 	t.Setenv("DOWNLOAD_PATH", base)
-	org, project := uuid.New(), codeclarity.Project{Id: uuid.New(), Url: localRepo(t)}
+	srv := newGitServer(t, nil)
+	srv.addRepo(t, "repo", map[string]string{"a": "a"}, "", "")
+	run(t, filepath.Join(srv.root, "repo.git"), "branch", "feature/x", "main")
+	trustServers(t)
+	treatAllAddressesAsPublic(t)
+	fakeDNS(t, map[string]string{"gitlab.test": "127.0.0.1"})
+	host := "gitlab.test:" + srv.port(t)
+	org, project := uuid.New(), codeclarity.Project{Id: uuid.New(), Url: "https://" + host + "/repo.git"}
 
-	if err := Git(codeclarity.Analysis{Branch: "feature/x"}, project, codeclarity.Integration{}, org); err != nil {
+	if err := Git(codeclarity.Analysis{Branch: "feature/x"}, project, gitlabIntegration("https://"+host), org); err != nil {
 		t.Fatalf("Git: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(base, org.String(), "projects", project.Id.String(), "feature", "x", ".git")); err != nil {
