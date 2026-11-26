@@ -23,6 +23,9 @@ const (
 	cacheTestSHA2 = "87310da049cc2361ece0273daef7e5e46dc6d3f5"
 )
 
+// cacheTestRemote is the public test repository, fetched with no token.
+var cacheTestRemote = remote{url: cacheTestURL}
+
 // requireRemote skips network-dependent tests offline and fails them in CI.
 func requireRemote(t *testing.T) {
 	t.Helper()
@@ -40,7 +43,7 @@ func TestGitCacheMaterialize(t *testing.T) {
 
 	// First materialization creates the cache and checks out the commit.
 	dest1 := filepath.Join(base, "projects", "project-1", cacheTestSHA1)
-	if err := materializeFromCache(ctx, cacheTestURL, cacheBase, dest1, cacheTestSHA1, ""); err != nil {
+	if err := materializeFromCache(ctx, cacheTestRemote, cacheBase, dest1, cacheTestSHA1, ""); err != nil {
 		t.Fatalf("first materialize: %v", err)
 	}
 	if !checkedOutAt(ctx, dest1, cacheTestSHA1) {
@@ -53,7 +56,7 @@ func TestGitCacheMaterialize(t *testing.T) {
 		t.Fatalf("cache dir missing after first materialize: %v", err)
 	}
 	dest2 := filepath.Join(base, "projects", "project-1", cacheTestSHA2)
-	if err := materializeFromCache(ctx, cacheTestURL, cacheBase, dest2, cacheTestSHA2, ""); err != nil {
+	if err := materializeFromCache(ctx, cacheTestRemote, cacheBase, dest2, cacheTestSHA2, ""); err != nil {
 		t.Fatalf("second materialize: %v", err)
 	}
 	if !checkedOutAt(ctx, dest2, cacheTestSHA2) {
@@ -64,13 +67,13 @@ func TestGitCacheMaterialize(t *testing.T) {
 	}
 
 	// Re-materializing an existing leaf is a no-op (existing-checkout fast path).
-	if err := materializeFromCache(ctx, cacheTestURL, cacheBase, dest1, cacheTestSHA1, ""); err != nil {
+	if err := materializeFromCache(ctx, cacheTestRemote, cacheBase, dest1, cacheTestSHA1, ""); err != nil {
 		t.Fatalf("re-materialize existing leaf: %v", err)
 	}
 
 	// HEAD analysis: leaf lands on the branch at the freshly fetched tip.
 	destHead := filepath.Join(base, "projects", "project-1", "main")
-	if err := materializeFromCache(ctx, cacheTestURL, cacheBase, destHead, "", "main"); err != nil {
+	if err := materializeFromCache(ctx, cacheTestRemote, cacheBase, destHead, "", "main"); err != nil {
 		t.Fatalf("HEAD materialize: %v", err)
 	}
 	tip, err := gitOutput(ctx, cacheBase+".git", "rev-parse", "refs/heads/main")
@@ -99,7 +102,7 @@ func TestGitCacheFailureBackoff(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	err := materializeFromCache(ctx, "https://invalid.invalid/x", cacheBase, filepath.Join(base, "leaf"), cacheTestSHA1, "")
+	err := materializeFromCache(ctx, remote{url: "https://invalid.invalid/x"}, cacheBase, filepath.Join(base, "leaf"), cacheTestSHA1, "")
 	if err == nil || !strings.Contains(err.Error(), "backoff") {
 		t.Fatalf("expected backoff error, got: %v", err)
 	}
@@ -144,7 +147,7 @@ func TestGitFullFlowViaCache(t *testing.T) {
 
 	for _, sha := range []string{cacheTestSHA1, cacheTestSHA2} {
 		analysis.Commit = sha
-		if err := Git(analysis, project, codeclarity.Integration{}, org); err != nil {
+		if err := Git(analysis, project, codeclarity.Integration{ServiceDomain: "github.com"}, org); err != nil {
 			t.Fatalf("Git() for %s: %v", sha, err)
 		}
 		dest := fmt.Sprintf("%s/%s/projects/%s/%s", base, org, project.Id, sha)
