@@ -22,3 +22,6 @@
 
 .netrc
 tmp
+
+# Local go build output
+/service-project-downloader
